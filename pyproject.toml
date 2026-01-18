@@ -27,6 +27,7 @@ classifiers = [
 dependencies = [
 	"PyQt6==6.10.0",
 	"luaparser==4.0.0",
+	"cryptography>=41.0.0",
 ]
 
 [project.optional-dependencies]

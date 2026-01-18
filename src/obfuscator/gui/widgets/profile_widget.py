@@ -143,6 +143,7 @@ class ProfileWidget(QWidget):
             language = config.get("language", "lua")
             options = config.get("options", {
                 "string_encryption_key_length": 16,
+                "array_shuffle_seed": None,
                 "dead_code_percentage": 20,
                 "identifier_prefix": "_0x",
             })

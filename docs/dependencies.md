@@ -16,6 +16,7 @@ Each dependency has been carefully selected to provide specific functionality wh
 |------------|---------|---------|---------|
 | PyQt6 | 6.10.0 | GUI framework for the obfuscator interface | GPL v3 / Commercial |
 | luaparser | 4.0.0 | Lua code parsing and AST generation | MIT |
+| cryptography | >=41.0.0 | String encryption using AES-256-GCM | Apache 2.0 / BSD |
 | pathlib | stdlib | Cross-platform path handling | PSF |
 
 ### PyQt6 (6.10.0)
@@ -44,6 +45,28 @@ Each dependency has been carefully selected to provide specific functionality wh
 - Parses Lua 5.3 syntax
 - Generates detailed AST nodes for all Lua constructs
 - Enables programmatic code transformation
+
+### cryptography (>=41.0.0)
+
+**Purpose:** Provides secure cryptographic primitives for string encryption obfuscation.
+
+**Why cryptography:**
+- Industry-standard cryptographic library with extensive security auditing
+- Provides AES-256-GCM authenticated encryption for Python string obfuscation
+- Well-maintained with regular security updates
+- Apache 2.0 / BSD dual-license allows flexible usage
+
+**Key Features:**
+- AES-256-GCM authenticated encryption for Python code
+- Secure random key and IV generation
+- High-performance implementation using OpenSSL bindings
+- Cross-platform support (Windows, Linux, macOS)
+
+**Usage in Obfuscator:**
+- String literals in Python code are encrypted using AES-256-GCM
+- Encryption key length is configurable (default: 16 bytes)
+- A decryption runtime is injected into obfuscated code
+- Lua uses simpler XOR-based encryption for compatibility
 
 ### pathlib (Standard Library)
 

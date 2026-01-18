@@ -95,6 +95,7 @@ class ObfuscationConfig:
     features: Dict[str, bool] = field(default_factory=dict)
     options: Dict[str, Any] = field(default_factory=lambda: {
         "string_encryption_key_length": 16,
+        "array_shuffle_seed": None,
         "dead_code_percentage": 20,
         "identifier_prefix": "_0x",
     })
@@ -140,9 +141,20 @@ class ObfuscationConfig:
         
         # Check options types
         if "string_encryption_key_length" in self.options:
-            if not isinstance(self.options["string_encryption_key_length"], int):
+            key_length = self.options["string_encryption_key_length"]
+            if not isinstance(key_length, int):
                 raise ValueError(
                     "Option 'string_encryption_key_length' must be an integer"
+                )
+            if key_length <= 0:
+                raise ValueError(
+                    "Option 'string_encryption_key_length' must be a positive integer"
+                )
+            # Valid AES key lengths are 16, 24, 32 bytes; warn if too small
+            if key_length < 16:
+                logger.warning(
+                    f"string_encryption_key_length={key_length} is small; "
+                    "16 bytes or more is recommended for security"
                 )
         
         if "dead_code_percentage" in self.options:
@@ -152,6 +164,13 @@ class ObfuscationConfig:
         if "identifier_prefix" in self.options:
             if not isinstance(self.options["identifier_prefix"], str):
                 raise ValueError("Option 'identifier_prefix' must be a string")
+
+        if "array_shuffle_seed" in self.options:
+            seed = self.options["array_shuffle_seed"]
+            if seed is not None and not isinstance(seed, int):
+                raise ValueError(
+                    "Option 'array_shuffle_seed' must be an integer or None"
+                )
 
         # Check symbol_table_options
         valid_strategies = {"sequential", "random", "minimal"}
@@ -239,6 +258,7 @@ class ObfuscationConfig:
                 features=data.get("features", {}),
                 options=data.get("options", {
                     "string_encryption_key_length": 16,
+                    "array_shuffle_seed": None,
                     "dead_code_percentage": 20,
                     "identifier_prefix": "_0x",
                 }),
@@ -300,6 +320,7 @@ class ObfuscationConfig:
             features=json_features,
             options={
                 "string_encryption_key_length": 16,
+                "array_shuffle_seed": None,
                 "dead_code_percentage": 20,
                 "identifier_prefix": "_0x",
             },
@@ -317,4 +338,3 @@ class ObfuscationConfig:
         )
 
         return config
-

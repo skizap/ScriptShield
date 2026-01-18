@@ -169,6 +169,8 @@ graph LR
 | `DependencyAnalyzer` | `core/dependency_graph.py` | Builds graph from imports |
 | `GlobalSymbolTable` | `core/symbol_table.py` | Stores pre-computed mangled names |
 | `SymbolTableBuilder` | `core/symbol_table.py` | Constructs symbol table from graph |
+| `StringEncryptionTransformer` | `processors/ast_transformer.py` | Encrypts string literals |
+| `ConstantFoldingTransformer` | `processors/ast_transformer.py` | Folds constant expressions |
 
 ### Symbol Table Architecture
 
@@ -196,6 +198,95 @@ The orchestrator implements graceful error handling:
 - Parse errors are logged as warnings but don't stop processing
 - Unresolved imports are logged but allow partial obfuscation
 - Circular dependencies fall back to original file order with a warning
+
+## String Encryption
+
+The obfuscator provides string encryption to protect string literals from static
+analysis. This feature encrypts string constants in the source code and injects
+a decryption runtime that decrypts them at execution time.
+
+### Encryption Approach
+
+| Language | Algorithm | Library | Notes |
+|----------|-----------|---------|-------|
+| Python | AES-256-GCM | cryptography | Authenticated encryption with 12-byte nonce |
+| Lua | XOR cipher | Native | Simple XOR for Lua runtime compatibility |
+
+### Python String Encryption
+
+For Python code, string literals are encrypted using AES-256-GCM (Galois/Counter
+Mode), which provides both confidentiality and integrity:
+
+1. **Key Generation:** A random encryption key is generated using `secrets.token_bytes()`
+2. **Encryption:** Each string is encrypted with the key and a random 12-byte nonce
+3. **Encoding:** Encrypted bytes are base64-encoded for embedding in code
+4. **Runtime Injection:** A decryption function `_decrypt_string()` is injected at module level
+5. **Replacement:** String literals are replaced with `_decrypt_string(encrypted_b64)` calls
+
+```python
+# Before encryption
+message = "Hello, World!"
+
+# After encryption (conceptual)
+import base64 as _b64
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+_decrypt_key = _b64.b64decode("...")
+_decrypt_iv = _b64.b64decode("...")
+_decrypt_aesgcm = _AESGCM(_decrypt_key)
+
+def _decrypt_string(encrypted_b64: str) -> str:
+    encrypted_data = _b64.b64decode(encrypted_b64)
+    decrypted = _decrypt_aesgcm.decrypt(_decrypt_iv, encrypted_data, None)
+    return decrypted.decode("utf-8")
+
+message = _decrypt_string("...")
+```
+
+### Lua String Encryption
+
+For Lua code, a simpler XOR cipher is used due to limited cryptographic library
+support in standard Lua:
+
+1. **Key Generation:** Same random key generation as Python
+2. **Encryption:** XOR each byte with the corresponding key byte (cycling)
+3. **Encoding:** Encrypted bytes are embedded as escaped Lua string literals
+4. **Runtime Injection:** A Lua decryption function is injected at chunk level
+
+```lua
+-- Decryption runtime (injected)
+local _decrypt_key = "\123\45\67..."
+local function _decrypt_string(encrypted_data)
+    local result = {}
+    local key_len = #_decrypt_key
+    for i = 1, #encrypted_data do
+        local encrypted_byte = string.byte(encrypted_data, i)
+        local key_byte = string.byte(_decrypt_key, ((i - 1) % key_len) + 1)
+        result[i] = string.char(encrypted_byte ~ key_byte)
+    end
+    return table.concat(result)
+end
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `string_encryption_key_length` | int | 16 | Encryption key length in bytes (16, 24, or 32 for AES) |
+
+### Security Considerations
+
+- **Python AES-GCM:** Provides authenticated encryption; tampering with ciphertext will cause decryption to fail
+- **Lua XOR:** Less secure than AES; provides obfuscation but not cryptographic security
+- **Key Storage:** Encryption keys are embedded in the obfuscated code; determined attackers can extract them
+- **Purpose:** String encryption is meant to deter casual inspection, not protect against sophisticated reverse engineering
+
+### String Filtering
+
+The transformer skips certain strings to avoid breaking functionality:
+
+- Empty strings
+- Strings shorter than `min_string_length` (default: 3 characters)
+- Module docstrings (first string in a module body)
 
 ## Future Architecture
 
