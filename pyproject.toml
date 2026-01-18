@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obfuscator"
+version = "0.1.0"
+description = "A Lua code obfuscator with GUI"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+	{name = "Obfuscator Developers", email = "dev@obfuscator.local"},
+]
+license = {text = "MIT"}
+keywords = ["lua", "obfuscator", "code-protection", "pyqt6"]
+classifiers = [
+	"Development Status :: 3 - Alpha",
+	"Intended Audience :: Developers",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.9",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"License :: OSI Approved :: MIT License",
+	"Topic :: Software Development :: Code Generators",
+]
+dependencies = [
+	"PyQt6==6.10.0",
+	"luaparser==4.0.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.urls]
+Homepage = "https://github.com/<your-username>/python-obfuscator"
+Documentation = "https://github.com/<your-username>/python-obfuscator#readme"
+Repository = "https://github.com/<your-username>/python-obfuscator"
+"Bug Tracker" = "https://github.com/<your-username>/python-obfuscator/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--cov=src/obfuscator",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
