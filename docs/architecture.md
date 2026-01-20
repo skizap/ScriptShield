@@ -59,11 +59,11 @@ The Python package layout is centered around `src/obfuscator/`:
 
 - `src/obfuscator/`
   - `utils/`
-    - `src/obfuscator/utils/path_utils.py`  Cross-platform path utilities
-    - `src/obfuscator/utils/logger.py`  Logging configuration and helpers
-  - `gui/` *(planned)*  PyQt6-based widgets and application logic
-  - `parser/` *(planned)*  Lua parsing and AST handling abstractions
-  - `obfuscator/` *(planned)*  Core obfuscation engine and strategies
+    - `src/obfuscator/utils/path_utils.py`  �� Cross-platform path utilities
+    - `src/obfuscator/utils/logger.py`  �� Logging configuration and helpers
+  - `gui/` *(planned)*  �� PyQt6-based widgets and application logic
+  - `parser/` *(planned)*  �� Lua parsing and AST handling abstractions
+  - `obfuscator/` *(planned)*  �� Core obfuscation engine and strategies
 
 Test code lives under `tests/` and is wired via the `pytest` configuration in
 `pyproject.toml`.
@@ -77,11 +77,11 @@ introspection.
 
 **Typical responsibilities (non-exhaustive):**
 
-- `normalize_path(path)`  Normalize and expand user-provided paths (e.g. `~`).
-- `is_safe_path(base, target)`  Validate that `target` does not escape a
+- `normalize_path(path)`  �� Normalize and expand user-provided paths (e.g. `~`).
+- `is_safe_path(base, target)`  �� Validate that `target` does not escape a
   trusted `base` directory (guards against path traversal).
-- `validate_lua_file(path)`  Sanity checks for Lua source files.
-- `get_platform()`  Return a normalized platform identifier
+- `validate_lua_file(path)`  �� Sanity checks for Lua source files.
+- `get_platform()`  �� Return a normalized platform identifier
   (e.g. `"windows"`, `"macos"`, `"linux"`).
 - Convenience helpers like `is_windows()`, `is_macos()`, `is_linux()`.
 
@@ -97,11 +97,11 @@ and future end-user builds.
 
 **Key responsibilities:**
 
-- `setup_logger(name, level, log_file, ...)`  Configure a named logger with
+- `setup_logger(name, level, log_file, ...)`  �� Configure a named logger with
   console and file handlers.
-- `add_file_handler(logger, path)`  Attach a rotating file handler
+- `add_file_handler(logger, path)`  �� Attach a rotating file handler
   (e.g. up to 10 MB, multiple backups).
-- `set_log_level(logger, level)`  Dynamically change logging verbosity.
+- `set_log_level(logger, level)`  �� Dynamically change logging verbosity.
 
 **Design notes:**
 
@@ -288,6 +288,124 @@ The transformer skips certain strings to avoid breaking functionality:
 - Strings shorter than `min_string_length` (default: 3 characters)
 - Module docstrings (first string in a module body)
 
+## VM Protection
+
+The obfuscator provides VM-based code protection that converts functions to custom bytecode executed by a virtual machine. This provides strong obfuscation by hiding the original code structure.
+
+### VM Protection Architecture
+
+```mermaid
+graph TD
+    A[User Code] --> B[VMProtectionTransformer]
+    B --> C{Function Detection}
+    C -->|Protected| D[BytecodeCompiler]
+    C -->|Not Protected| E[Original Code]
+    D --> F[Bytecode Generation]
+    F --> G[VM Runtime Injection]
+    G --> H[Protected Code]
+    E --> H
+```
+
+### Bytecode Instruction Set
+
+The VM uses a custom bytecode instruction set with three complexity levels:
+
+**Basic (Level 1):**
+- `LOAD_CONST`, `LOAD_VAR`, `STORE_VAR`
+- `BINARY_ADD`, `BINARY_SUB`
+- `JUMP`, `JUMP_IF_FALSE`
+- `CALL_FUNC`, `RETURN`
+
+**Intermediate (Level 2):** Adds
+- `BINARY_MUL`, `BINARY_DIV`, `BINARY_MOD`
+- `COMPARE_EQ`, `COMPARE_LT`, `COMPARE_GT`
+- `LOAD_GLOBAL`, `STORE_GLOBAL`
+- `POP`, `DUP`
+
+**Advanced (Level 3):** Adds
+- `BINARY_POW`, `UNARY_NOT`, `UNARY_NEGATIVE`
+- `LOAD_ATTR`, `STORE_ATTR`
+- `BUILD_LIST`, `BUILD_MAP`
+- `LOAD_INDEX`, `STORE_INDEX`
+
+### VM Protection Process
+
+1. **Function Identification:** Detect functions marked with `@vm_protect` decorator or comment marker
+2. **Bytecode Compilation:** Convert function AST to custom bytecode instructions
+3. **Runtime Generation:** Inject VM interpreter capable of executing the bytecode
+4. **Wrapper Generation:** Replace original function with wrapper that invokes the VM
+
+### Python VM Runtime
+
+The Python VM runtime provides a stack-based virtual machine:
+
+```python
+class BytecodeVM:
+    def __init__(self, bytecode, constants, num_locals, globals_dict):
+        self.bytecode = bytecode
+        self.constants = constants
+        self.stack = []
+        self.locals = [None] * num_locals
+        self.ip = 0  # Instruction pointer
+    
+    def execute(self):
+        while self.ip < len(self.bytecode):
+            opcode = self._fetch()
+            self._dispatch(opcode)()
+```
+
+### Lua VM Runtime
+
+The Lua VM runtime provides similar functionality using Lua tables:
+
+```lua
+local BytecodeVM = {}
+function BytecodeVM:new(bytecode, constants, num_locals)
+    local vm = {
+        bytecode = bytecode,
+        constants = constants,
+        stack = {},
+        locals = {},
+        ip = 1
+    }
+    for i = 1, num_locals do
+        vm.locals[i] = nil
+    end
+    return vm
+end
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `vm_protection_complexity` | int | 2 | VM instruction set complexity (1-3) |
+| `vm_protect_all_functions` | bool | False | Protect all functions automatically |
+| `vm_bytecode_encryption` | bool | True | Encrypt bytecode data |
+| `vm_protection_marker` | string | "vm:protect" | Decorator/comment marker for protection |
+
+### Security Considerations
+
+- **Bytecode Encryption:** Optional AES encryption of bytecode prevents static analysis
+- **Runtime Obfuscation:** VM runtime itself can be obfuscated with other transformers
+- **Instruction Randomization:** Opcodes can be randomized per module
+- **Anti-Tampering:** Integrity checks can detect bytecode modification
+- **Performance:** VM interpretation adds 5-20x overhead; use selectively
+
+### Limitations
+
+- **Function Size:** Small functions (< 3 statements) are excluded to avoid overhead
+- **Unsupported Features:** Generators, async functions, and complex decorators are skipped
+- **Debugging:** Protected functions are harder to debug due to bytecode interpretation
+- **Not Foolproof:** Determined attackers can still reverse engineer by analyzing runtime behavior
+
+### Performance Impact
+
+- **Overhead:** VM interpretation adds 5-20x execution overhead compared to native code
+- **Code Size:** Protected functions increase code size by 2-4x due to bytecode and runtime
+- **Recommendation:** Only protect critical functions, not entire codebase
+- **Optimization:** Use complexity level 1 for performance-critical code
+
 ## Future Architecture
 
 Planned architectural extensions include:
@@ -315,4 +433,3 @@ Planned architectural extensions include:
   unavoidable platform differences in utility modules.
 - **Type safety:** Use type hints consistently to improve readability and enable
   static analysis.
-

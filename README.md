@@ -13,7 +13,11 @@ forms while preserving runtime behavior.
 - Cross-platform support for **Windows**, **macOS**, and **Linux**
 - Lua parsing and AST manipulation powered by **luaparser**
 - Safe, cross-platform file handling utilities
-- Configurable obfuscation strategies (planned)
+- **VM Protection** - Convert functions to bytecode executed by a virtual machine
+- **String Encryption** - Encrypt string literals with AES-256-GCM (Python) or XOR (Lua)
+- **Number Obfuscation** - Replace numeric constants with arithmetic expressions
+- **Constant Array Obfuscation** - Shuffle array elements and rewrite access patterns
+- Configurable obfuscation strategies
 - Focus on testability and extensibility
 
 **Technology stack:**
@@ -115,6 +119,82 @@ the core utilities:
 pytest
 ```
 
+## Obfuscation Features
+
+### VM Protection
+
+VM Protection converts functions to custom bytecode that is executed by a virtual machine, providing strong obfuscation:
+
+```python
+# Original code
+@vm_protect
+def sensitive_calculation(x, y):
+    result = x * 2 + y
+    return result
+
+# Obfuscated code (conceptual)
+def sensitive_calculation(*args):
+    __bytecode = [1, 2, 3, ...]  # Encoded bytecode
+    __constants = [2, ...]       # Constant pool
+    __num_locals = 3
+    return execute_protected_function(__bytecode, __constants, __num_locals, *args)
+```
+
+**Configuration:**
+- `vm_protection_complexity`: 1-3 (basic to advanced instruction set)
+- `vm_protect_all_functions`: Protect all functions automatically
+- `vm_bytecode_encryption`: Enable bytecode encryption
+- `vm_protection_marker`: Decorator/comment marker (default: "vm:protect")
+
+### String Encryption
+
+Encrypt string literals to hide them from static analysis:
+
+```python
+# Before
+message = "secret_key"
+
+# After
+message = _decrypt_string("encrypted_string_data")
+```
+
+**Configuration:**
+- `string_encryption_key_length`: 16, 24, or 32 bytes
+
+### Number Obfuscation
+
+Replace numeric constants with equivalent arithmetic expressions:
+
+```python
+# Before
+value = 42
+
+# After
+value = (21 * 2) + 0  # Evaluates to 42
+```
+
+**Configuration:**
+- `number_obfuscation_complexity`: 1-5 (simple to advanced expressions)
+- `number_obfuscation_min_value`: Minimum value to obfuscate
+- `number_obfuscation_max_value`: Maximum value to obfuscate
+
+### Constant Array Obfuscation
+
+Shuffle array elements and rewrite access patterns:
+
+```python
+# Before
+data = [1, 2, 3, 4, 5]
+result = data[2]  # Returns 3
+
+# After
+data = [3, 5, 1, 4, 2]  # Shuffled
+result = data[_arr_0_map[2]]  # Still returns 3
+```
+
+**Configuration:**
+- `array_shuffle_seed`: Seed for deterministic shuffling (None for random)
+
 ## Project Structure
 
 A high-level view of the repository layout:
@@ -123,17 +203,32 @@ A high-level view of the repository layout:
 .
 ├─ src/
 │  └─ obfuscator/
-│     └─ utils/
-├─ tests/
-├─ docs/
+│     ├─ processors/          # AST transformers and obfuscation logic
+│     │  ├─ ast_transformer.py
+│     │  ├─ vm_bytecode.py
+│     │  ├─ vm_runtime_python.py
+│     │  └─ vm_runtime_lua.py
+│     ├─ core/                # Core orchestration and configuration
+│     │  ├─ config.py
+│     │  └─ orchestrator.py
+│     └─ utils/               # Reusable utilities
+│        ├─ path_utils.py
+│        └─ logger.py
+├─ tests/                     # Pytest-based unit and integration tests
+├─ docs/                      # Project documentation
 │  ├─ dependencies.md
 │  └─ architecture.md
-├─ scripts/
+├─ scripts/                   # Helper scripts
 ├─ pyproject.toml
 └─ README.md
 ```
 
-- **src/obfuscator/** – Main package containing application code
+- **src/obfuscator/processors/** – AST transformers and obfuscation logic
+  - `ast_transformer.py` - VM protection, string encryption, number obfuscation, constant array transformers
+  - `vm_bytecode.py` - Bytecode instruction set and compilers for Python/Lua
+  - `vm_runtime_python.py` - Python VM interpreter runtime generator
+  - `vm_runtime_lua.py` - Lua VM interpreter runtime generator
+- **src/obfuscator/core/** – Core orchestration and configuration
 - **src/obfuscator/utils/** – Reusable utilities (path handling, logging, etc.)
 - **tests/** – Pytest-based unit and integration tests
 - **docs/** – Project documentation, including dependencies and architecture
@@ -168,7 +263,7 @@ For a deeper dive into the internals, see
     PyQt6 and platform-specific caveats.
 
 - **Issues and bugs**
-  - If you run into problems, please open an issue on the project’s issue
+  - If you run into problems, please open an issue on the project's issue
     tracker (for example:
     `https://github.com/<your-username>/python-obfuscator/issues`). Include
     your OS, Python version, and a minimal reproduction if possible.

@@ -98,6 +98,13 @@ class ObfuscationConfig:
         "array_shuffle_seed": None,
         "dead_code_percentage": 20,
         "identifier_prefix": "_0x",
+        "number_obfuscation_complexity": 3,
+        "number_obfuscation_min_value": 10,
+        "number_obfuscation_max_value": 1000000,
+        "vm_protection_complexity": 2,
+        "vm_protect_all_functions": False,
+        "vm_bytecode_encryption": True,
+        "vm_protection_marker": "vm_protect",
     })
     symbol_table_options: Dict[str, Any] = field(default_factory=lambda: {
         "identifier_prefix": "_0x",
@@ -170,6 +177,69 @@ class ObfuscationConfig:
             if seed is not None and not isinstance(seed, int):
                 raise ValueError(
                     "Option 'array_shuffle_seed' must be an integer or None"
+                )
+
+        if "number_obfuscation_complexity" in self.options:
+            complexity = self.options["number_obfuscation_complexity"]
+            if not isinstance(complexity, int):
+                raise ValueError(
+                    "Option 'number_obfuscation_complexity' must be an integer"
+                )
+            if not 1 <= complexity <= 5:
+                raise ValueError(
+                    "Option 'number_obfuscation_complexity' must be between 1 and 5"
+                )
+
+        if "number_obfuscation_min_value" in self.options:
+            min_val = self.options["number_obfuscation_min_value"]
+            if not isinstance(min_val, int):
+                raise ValueError(
+                    "Option 'number_obfuscation_min_value' must be an integer"
+                )
+            if min_val < 0:
+                raise ValueError(
+                    "Option 'number_obfuscation_min_value' must be non-negative"
+                )
+
+        if "number_obfuscation_max_value" in self.options:
+            max_val = self.options["number_obfuscation_max_value"]
+            if not isinstance(max_val, int):
+                raise ValueError(
+                    "Option 'number_obfuscation_max_value' must be an integer"
+                )
+            if max_val <= 0:
+                raise ValueError(
+                    "Option 'number_obfuscation_max_value' must be positive"
+                )
+
+        # VM Protection options validation
+        if "vm_protection_complexity" in self.options:
+            vm_complexity = self.options["vm_protection_complexity"]
+            if not isinstance(vm_complexity, int):
+                raise ValueError(
+                    "Option 'vm_protection_complexity' must be an integer"
+                )
+            if not 1 <= vm_complexity <= 3:
+                raise ValueError(
+                    "Option 'vm_protection_complexity' must be between 1 and 3"
+                )
+
+        if "vm_protect_all_functions" in self.options:
+            if not isinstance(self.options["vm_protect_all_functions"], bool):
+                raise ValueError(
+                    "Option 'vm_protect_all_functions' must be a boolean"
+                )
+
+        if "vm_bytecode_encryption" in self.options:
+            if not isinstance(self.options["vm_bytecode_encryption"], bool):
+                raise ValueError(
+                    "Option 'vm_bytecode_encryption' must be a boolean"
+                )
+
+        if "vm_protection_marker" in self.options:
+            if not isinstance(self.options["vm_protection_marker"], str):
+                raise ValueError(
+                    "Option 'vm_protection_marker' must be a string"
                 )
 
         # Check symbol_table_options
@@ -261,6 +331,13 @@ class ObfuscationConfig:
                     "array_shuffle_seed": None,
                     "dead_code_percentage": 20,
                     "identifier_prefix": "_0x",
+                    "number_obfuscation_complexity": 3,
+                    "number_obfuscation_min_value": 10,
+                    "number_obfuscation_max_value": 1000000,
+                    "vm_protection_complexity": 2,
+                    "vm_protect_all_functions": False,
+                    "vm_bytecode_encryption": True,
+                    "vm_protection_marker": "vm:protect",
                 }),
                 symbol_table_options=data.get("symbol_table_options", {
                     "identifier_prefix": "_0x",
@@ -323,6 +400,13 @@ class ObfuscationConfig:
                 "array_shuffle_seed": None,
                 "dead_code_percentage": 20,
                 "identifier_prefix": "_0x",
+                "number_obfuscation_complexity": 3,
+                "number_obfuscation_min_value": 10,
+                "number_obfuscation_max_value": 1000000,
+                "vm_protection_complexity": 2,
+                "vm_protect_all_functions": False,
+                "vm_bytecode_encryption": True,
+                "vm_protection_marker": "vm:protect",
             },
             symbol_table_options={
                 "identifier_prefix": "_0x",
