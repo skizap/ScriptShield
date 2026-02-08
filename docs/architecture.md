@@ -406,6 +406,85 @@ end
 - **Recommendation:** Only protect critical functions, not entire codebase
 - **Optimization:** Use complexity level 1 for performance-critical code
 
+## Coordinated Obfuscation Engine
+
+The `ObfuscationEngine` (`core/obfuscation_engine.py`) provides a centralized
+pipeline for applying all AST transformations beyond name mangling. It reads
+feature flags from `ObfuscationConfig`, instantiates enabled transformers in a
+fixed dependency order, and applies them sequentially to the AST.
+
+### Transformation Pipeline Order
+
+| Order | Feature Flag | Transformer | Rationale |
+|-------|-------------|-------------|-----------|
+| 1 | `string_encryption` | `StringEncryptionTransformer` | Encrypt string literals before structural changes |
+| 2 | `number_obfuscation` | `NumberObfuscationTransformer` | Replace numeric constants with expressions |
+| 3 | `constant_array` | `ConstantArrayTransformer` | Shuffle arrays and inject index mappings |
+| 4 | `mangle_indexes` | `MangleIndexesTransformer` | Obfuscate dictionary/table key access |
+| 5 | `vm_protection` | `VMProtectionTransformer` | Wrap functions in bytecode VM (must run last) |
+
+Value-level transformations (strings, numbers, arrays) run before structural
+transformations (index mangling, VM wrapping). VM protection runs last because
+it wraps entire functions into bytecode interpreters and should capture the
+fully obfuscated function bodies.
+
+### Feature Flag System
+
+Each transformer is gated by a boolean feature flag in `ObfuscationConfig.features`.
+The engine only instantiates transformers whose flags are `True`. All transformers
+receive the full `ObfuscationConfig` so they can read their specific options
+(e.g., `number_obfuscation_complexity`, `vm_protection_complexity`).
+
+### Integration Flow
+
+The engine is invoked by language-specific processors after name mangling:
+
+```mermaid
+sequenceDiagram
+    participant O as ObfuscationOrchestrator
+    participant P as Processor (Python/Lua)
+    participant E as ObfuscationEngine
+    participant T as Transformers
+    participant G as GlobalSymbolTable
+
+    O->>O: Build GlobalSymbolTable
+    O->>P: obfuscate_with_symbol_table(ast, file, global_table)
+    P->>P: Apply NameManglingTransformer
+    P->>E: apply_transformations(ast, language, file)
+    E->>E: get_enabled_transformers(language)
+    E->>T: StringEncryptionTransformer.transform(ast)
+    T-->>E: TransformResult
+    E->>T: NumberObfuscationTransformer.transform(ast)
+    T-->>E: TransformResult
+    E->>T: ConstantArrayTransformer.transform(ast)
+    T-->>E: TransformResult
+    E->>T: MangleIndexesTransformer.transform(ast)
+    T-->>E: TransformResult
+    E->>T: VMProtectionTransformer.transform(ast)
+    T-->>E: TransformResult
+    E-->>P: Final TransformResult
+    P->>P: generate_code(transformed_ast)
+    P-->>O: GenerateResult
+```
+
+### Graceful Degradation
+
+If the engine transformation pipeline fails for any reason, the processor falls
+back to the name-mangled AST. This ensures that name mangling (the most
+critical transformation) always succeeds even when optional transformers
+encounter errors.
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Engine in `core/` not `processors/` | Engine coordinates processors, belongs in core orchestration layer |
+| Pass config to transformers | Transformers need access to their specific options |
+| Constants before structure | String/number/array obfuscation should happen before VM protection wraps functions |
+| VM protection last | Wrapping functions in bytecode interpreter should be the final structural change |
+| Language-aware filtering | Only instantiate transformers compatible with the target language |
+| Graceful degradation | If transformations fail, fall back to name-mangling only rather than failing completely |
+
 ## Future Architecture
 
 Planned architectural extensions include:

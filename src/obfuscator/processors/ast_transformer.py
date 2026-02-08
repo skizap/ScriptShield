@@ -3397,3 +3397,1954 @@ class VMProtectionTransformer(ASTTransformer):
                 transformation_count=self.transformation_count,
                 errors=self.errors,
             )
+
+
+class DeadCodeInjectionTransformer(ASTTransformer):
+    """Injects syntactically valid but unreachable dead code for obfuscation.
+
+    This transformer injects realistic-looking dead code at strategic unreachable
+    locations to confuse static analysis while ensuring the code never executes.
+    It supports both Python and Lua languages.
+
+    Dead code is injected at:
+    - After return statements (unreachable)
+    - Inside always-false conditionals (if False: ...)
+    - After unconditional break statements
+
+    For Python, generates:
+    - Variable assignments with arithmetic expressions
+    - Unreachable function calls (len(), str(), int())
+    - Dead loops: for _ in range(0): ... or while False: ...
+    - Dead conditionals: if False: ... with nested statements
+    - Dead try/except blocks with empty handlers
+
+    For Lua, generates:
+    - Local variable assignments with expressions
+    - Unreachable function calls (print(), tostring())
+    - Dead loops: for i = 1, 0 do ... end or while false do ... end
+    - Dead conditionals: if false then ... end
+
+    Attributes:
+        config: ObfuscationConfig instance with dead code options
+        dead_code_percentage: Probability (0-100) of injecting at each eligible location
+        language_mode: Detected language ('python', 'lua', or None)
+        injection_count: Counter for number of dead code blocks injected
+        errors: List of error messages collected during transformation
+
+    Example:
+        >>> from obfuscator.core.config import ObfuscationConfig
+        >>> config = ObfuscationConfig(
+        ...     name="test",
+        ...     features={"dead_code_injection": True},
+        ...     options={"dead_code_percentage": 30}
+        ... )
+        >>> transformer = DeadCodeInjectionTransformer(config)
+        >>> tree = ast.parse("def f(): return 42")
+        >>> result = transformer.transform(tree)
+        >>> if result.success:
+        ...     print(f"Injected {result.transformation_count} dead code blocks")
+
+    Limitations:
+    - Dead code is never executed but increases file size
+    - Very high percentages (>80%) may significantly bloat code
+    - Does not inject into lambda functions
+    """
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        dead_code_percentage: Optional[int] = None,
+    ) -> None:
+        """Initialize the dead code injection transformer.
+
+        Args:
+            config: ObfuscationConfig instance with dead_code_percentage option.
+                   If provided, extracts settings from config.options.
+            dead_code_percentage: Percentage (0-100) for injection probability.
+                                Overrides config if explicitly set.
+        """
+        super().__init__()
+        self.logger = get_logger("obfuscator.processors.dead_code_injection")
+
+        # Determine percentage from config or parameter
+        if dead_code_percentage is not None:
+            self.dead_code_percentage = dead_code_percentage
+        elif config is not None and hasattr(config, 'options'):
+            self.dead_code_percentage = config.options.get('dead_code_percentage', 20)
+        else:
+            self.dead_code_percentage = 20
+
+        # Validate percentage range
+        self.dead_code_percentage = max(0, min(100, self.dead_code_percentage))
+
+        self.config = config
+
+        # Language detection and tracking
+        self.language_mode: Optional[str] = None
+        self.injection_count: int = 0
+
+        # Variable name pools for realistic dead code
+        self._python_var_prefixes = ['_tmp_', '_unused_', '_cache_', '_dead_', '_aux_']
+        self._lua_var_prefixes = ['_tmp_', '_unused_', '_cache_', '_dead_', '_aux_']
+        self._var_counter: int = 0
+
+        self.logger.debug(
+            f"DeadCodeInjectionTransformer initialized with "
+            f"dead_code_percentage={self.dead_code_percentage}"
+        )
+
+    def _should_inject(self) -> bool:
+        """Determine if dead code should be injected at current location.
+
+        Uses dead_code_percentage to decide probabilistically.
+
+        Returns:
+            True if dead code should be injected here.
+        """
+        return random.randint(0, 99) < self.dead_code_percentage
+
+    def _generate_python_variable_name(self) -> str:
+        """Generate a realistic-looking unused variable name for Python.
+
+        Returns:
+            Variable name like '_tmp_0', '_unused_1', etc.
+        """
+        prefix = random.choice(self._python_var_prefixes)
+        name = f"{prefix}{self._var_counter}"
+        self._var_counter += 1
+        return name
+
+    def _generate_lua_variable_name(self) -> str:
+        """Generate a realistic-looking unused variable name for Lua.
+
+        Returns:
+            Variable name like '_tmp_0', '_unused_1', etc.
+        """
+        prefix = random.choice(self._lua_var_prefixes)
+        name = f"{prefix}{self._var_counter}"
+        self._var_counter += 1
+        return name
+
+    def _create_python_arithmetic_expression(self) -> ast.expr:
+        """Create a random arithmetic expression for Python dead code.
+
+        Returns:
+            AST expression node with arithmetic operations.
+        """
+        patterns = [
+            # Simple binary operations
+            lambda: ast.BinOp(
+                left=ast.Constant(value=random.randint(1, 100)),
+                op=ast.Add(),
+                right=ast.Constant(value=random.randint(1, 100))
+            ),
+            lambda: ast.BinOp(
+                left=ast.Constant(value=random.randint(1, 50)),
+                op=ast.Mult(),
+                right=ast.Constant(value=random.randint(2, 10))
+            ),
+            lambda: ast.BinOp(
+                left=ast.Constant(value=random.randint(100, 200)),
+                op=ast.Sub(),
+                right=ast.Constant(value=random.randint(1, 99))
+            ),
+            # Comparison expressions
+            lambda: ast.Compare(
+                left=ast.Constant(value=random.randint(1, 100)),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=random.randint(1, 100))]
+            ),
+            # String operations
+            lambda: ast.Call(
+                func=ast.Name(id='len', ctx=ast.Load()),
+                args=[ast.Constant(value='')],
+                keywords=[]
+            ),
+            lambda: ast.Call(
+                func=ast.Name(id='str', ctx=ast.Load()),
+                args=[ast.Constant(value=random.randint(1, 100))],
+                keywords=[]
+            ),
+        ]
+        return random.choice(patterns)()
+
+    def _create_python_dead_assignment(self) -> ast.Assign:
+        """Create a dead variable assignment for Python.
+
+        Returns:
+            Assign AST node with random expression.
+        """
+        var_name = self._generate_python_variable_name()
+        return ast.Assign(
+            targets=[ast.Name(id=var_name, ctx=ast.Store())],
+            value=self._create_python_arithmetic_expression()
+        )
+
+    def _create_python_dead_call(self) -> ast.Expr:
+        """Create a dead function call expression for Python.
+
+        Returns:
+            Expr AST node wrapping a function call.
+        """
+        builtin_funcs = ['len', 'str', 'int', 'float', 'abs', 'max', 'min']
+        func_name = random.choice(builtin_funcs)
+        args = [ast.Constant(value=random.randint(1, 100))]
+
+        return ast.Expr(
+            value=ast.Call(
+                func=ast.Name(id=func_name, ctx=ast.Load()),
+                args=args,
+                keywords=[]
+            )
+        )
+
+    def _create_python_dead_loop(self) -> ast.stmt:
+        """Create a dead loop that never executes for Python.
+
+        Returns:
+            For or While AST node with always-false condition.
+        """
+        if random.choice([True, False]):
+            # for _ in range(0): pass
+            return ast.For(
+                target=ast.Name(id='_', ctx=ast.Store()),
+                iter=ast.Call(
+                    func=ast.Name(id='range', ctx=ast.Load()),
+                    args=[ast.Constant(value=0)],
+                    keywords=[]
+                ),
+                body=[ast.Pass()],
+                orelse=[]
+            )
+        else:
+            # while False: pass
+            return ast.While(
+                test=ast.Constant(value=False),
+                body=[ast.Pass()],
+                orelse=[]
+            )
+
+    def _create_python_dead_conditional(self) -> ast.If:
+        """Create a dead if statement that never executes for Python.
+
+        Returns:
+            If AST node with False condition and dead body.
+        """
+        # Generate 1-3 dead statements for the body
+        body_stmts = []
+        for _ in range(random.randint(1, 3)):
+            stmt_type = random.choice(['assign', 'call', 'loop'])
+            if stmt_type == 'assign':
+                body_stmts.append(self._create_python_dead_assignment())
+            elif stmt_type == 'call':
+                body_stmts.append(self._create_python_dead_call())
+            else:
+                body_stmts.append(self._create_python_dead_loop())
+
+        return ast.If(
+            test=ast.Constant(value=False),
+            body=body_stmts,
+            orelse=[]
+        )
+
+    def _generate_python_dead_code(self, count: int = 1) -> list[ast.stmt]:
+        """Generate dead code statements for Python.
+
+        Args:
+            count: Number of dead code blocks to generate.
+
+        Returns:
+            List of dead code AST statement nodes.
+        """
+        statements = []
+        for _ in range(count):
+            stmt_type = random.choice(['assign', 'call', 'conditional', 'loop'])
+            try:
+                if stmt_type == 'assign':
+                    statements.append(self._create_python_dead_assignment())
+                elif stmt_type == 'call':
+                    statements.append(self._create_python_dead_call())
+                elif stmt_type == 'conditional':
+                    statements.append(self._create_python_dead_conditional())
+                else:
+                    statements.append(self._create_python_dead_loop())
+            except Exception as e:
+                # Log error but continue with other statements
+                self.logger.debug(f"Failed to generate dead code statement: {e}")
+                continue
+
+        return statements
+
+    def _inject_dead_code_after_return_python(
+        self, body: list[ast.stmt]
+    ) -> list[ast.stmt]:
+        """Inject dead code after return statements in Python function body.
+
+        Args:
+            body: Original function body statements.
+
+        Returns:
+            Modified body with dead code injected after returns.
+        """
+        new_body = []
+        injected_locations = set()
+
+        for i, stmt in enumerate(body):
+            new_body.append(stmt)
+
+            # Check if this is a return statement
+            if isinstance(stmt, ast.Return):
+                if self._should_inject() and i not in injected_locations:
+                    # Inject 1-3 dead code statements
+                    dead_count = random.randint(1, 3)
+                    dead_code = self._generate_python_dead_code(dead_count)
+                    for dead_stmt in dead_code:
+                        ast.fix_missing_locations(dead_stmt)
+                        new_body.append(dead_stmt)
+                        self.injection_count += 1
+                        self.transformation_count += 1
+                    injected_locations.add(i)
+                    self.logger.debug(f"Injected {len(dead_code)} dead code statements after return")
+
+        return new_body
+
+    def _inject_dead_code_after_break_python(
+        self, body: list[ast.stmt]
+    ) -> list[ast.stmt]:
+        """Inject dead code after break statements in Python loop body.
+
+        Args:
+            body: Original loop body statements.
+
+        Returns:
+            Modified body with dead code injected after breaks.
+        """
+        new_body = []
+        injected_locations = set()
+
+        for i, stmt in enumerate(body):
+            new_body.append(stmt)
+
+            # Check if this is a break statement
+            if isinstance(stmt, ast.Break):
+                if self._should_inject() and i not in injected_locations:
+                    # Inject 1-3 dead code statements
+                    dead_count = random.randint(1, 3)
+                    dead_code = self._generate_python_dead_code(dead_count)
+                    for dead_stmt in dead_code:
+                        ast.fix_missing_locations(dead_stmt)
+                        new_body.append(dead_stmt)
+                        self.injection_count += 1
+                        self.transformation_count += 1
+                    injected_locations.add(i)
+                    self.logger.debug(f"Injected {len(dead_code)} dead code statements after break")
+
+        return new_body
+
+    def _create_lua_dead_assignment(self) -> Any:
+        """Create a dead variable assignment for Lua.
+
+        Returns:
+            Lua AST assignment node.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        var_name = self._generate_lua_variable_name()
+        # Create a simple numeric expression
+        value = lua_nodes.Number(random.randint(1, 100))
+
+        return lua_nodes.LocalAssign(
+            targets=[lua_nodes.Name(var_name)],
+            values=[value]
+        )
+
+    def _create_lua_dead_call(self) -> Any:
+        """Create a dead function call expression for Lua.
+
+        Returns:
+            Lua AST call statement node.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        # Choose a common Lua function
+        func_name = random.choice(['print', 'tostring', 'tonumber', 'type'])
+        args = [lua_nodes.String('dead')]
+
+        call = lua_nodes.Call(
+            func=lua_nodes.Name(func_name),
+            args=args
+        )
+        return lua_nodes.Assign(
+            targets=[lua_nodes.Name('_discard_')],
+            values=[call]
+        )
+
+    def _create_lua_dead_loop(self) -> Any:
+        """Create a dead loop that never executes for Lua.
+
+        Returns:
+            Lua AST While node with always-false condition.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        # while false do end
+        return lua_nodes.While(
+            test=lua_nodes.FalseExpr(),
+            body=lua_nodes.Block([])
+        )
+
+    def _create_lua_dead_conditional(self) -> Any:
+        """Create a dead if statement that never executes for Lua.
+
+        Returns:
+            Lua AST If node with false condition.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        # Generate 1-2 dead statements for the body
+        body_stmts = []
+        for _ in range(random.randint(1, 2)):
+            stmt_type = random.choice(['assign', 'call'])
+            if stmt_type == 'assign':
+                stmt = self._create_lua_dead_assignment()
+            else:
+                stmt = self._create_lua_dead_call()
+            if stmt:
+                body_stmts.append(stmt)
+
+        return lua_nodes.If(
+            test=lua_nodes.FalseExpr(),
+            body=lua_nodes.Block(body_stmts),
+            orelse=lua_nodes.Block([])
+        )
+
+    def _generate_lua_dead_code(self, count: int = 1) -> list[Any]:
+        """Generate dead code statements for Lua.
+
+        Args:
+            count: Number of dead code blocks to generate.
+
+        Returns:
+            List of dead code Lua AST statement nodes.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return []
+
+        statements = []
+        for _ in range(count):
+            stmt_type = random.choice(['assign', 'call', 'conditional', 'loop'])
+            try:
+                if stmt_type == 'assign':
+                    stmt = self._create_lua_dead_assignment()
+                elif stmt_type == 'call':
+                    stmt = self._create_lua_dead_call()
+                elif stmt_type == 'conditional':
+                    stmt = self._create_lua_dead_conditional()
+                else:
+                    stmt = self._create_lua_dead_loop()
+
+                if stmt:
+                    statements.append(stmt)
+            except Exception as e:
+                self.logger.debug(f"Failed to generate Lua dead code: {e}")
+                continue
+
+        return statements
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        """Visit and inject dead code into Python function definition.
+
+        Args:
+            node: The FunctionDef AST node to potentially transform.
+
+        Returns:
+            Transformed function node with dead code injected after returns.
+        """
+        # First visit children for nested transformations
+        self.generic_visit(node)
+
+        # Inject dead code after return statements
+        if self._should_inject() or self.dead_code_percentage == 100:
+            new_body = self._inject_dead_code_after_return_python(node.body)
+
+            if new_body is not node.body:
+                # Create new function node with modified body
+                new_node = ast.FunctionDef(
+                    name=node.name,
+                    args=node.args,
+                    body=new_body,
+                    decorator_list=node.decorator_list,
+                    returns=node.returns,
+                    type_comment=node.type_comment
+                )
+                ast.copy_location(new_node, node)
+                return new_node
+
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        """Visit async function definition - apply same dead code injection.
+
+        Args:
+            node: The AsyncFunctionDef AST node.
+
+        Returns:
+            Transformed node with dead code injected.
+        """
+        # Apply same transformation as regular functions
+        self.generic_visit(node)
+
+        if self._should_inject() or self.dead_code_percentage == 100:
+            new_body = self._inject_dead_code_after_return_python(node.body)
+
+            if new_body is not node.body:
+                new_node = ast.AsyncFunctionDef(
+                    name=node.name,
+                    args=node.args,
+                    body=new_body,
+                    decorator_list=node.decorator_list,
+                    returns=node.returns,
+                    type_comment=node.type_comment
+                )
+                ast.copy_location(new_node, node)
+                return new_node
+
+        return node
+
+    def visit_While(self, node: ast.While) -> ast.AST:
+        """Visit while loop and inject dead code after break statements.
+
+        Args:
+            node: The While AST node.
+
+        Returns:
+            Transformed node with dead code injected after breaks.
+        """
+        # Visit children first
+        self.generic_visit(node)
+
+        # Inject dead code after break statements in the loop body
+        if self._should_inject() or self.dead_code_percentage == 100:
+            new_body = self._inject_dead_code_after_break_python(node.body)
+            if new_body is not node.body:
+                node.body = new_body
+
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.AST:
+        """Visit for loop and inject dead code after break statements.
+
+        Args:
+            node: The For AST node.
+
+        Returns:
+            Transformed node with dead code injected after breaks.
+        """
+        # Visit children first
+        self.generic_visit(node)
+
+        # Inject dead code after break statements in the loop body
+        if self._should_inject() or self.dead_code_percentage == 100:
+            new_body = self._inject_dead_code_after_break_python(node.body)
+            if new_body is not node.body:
+                node.body = new_body
+
+        return node
+
+    def visit_If(self, node: ast.If) -> ast.AST:
+        """Visit if statement and potentially add dead code.
+
+        Args:
+            node: The If AST node.
+
+        Returns:
+            Transformed node with potential dead code in false branches.
+        """
+        # Visit children first
+        self.generic_visit(node)
+
+        # Potentially inject dead code in else branch
+        if not node.orelse and self._should_inject():
+            # Create a false conditional as else
+            dead_if = self._create_python_dead_conditional()
+            ast.fix_missing_locations(dead_if)
+            node.orelse = [dead_if]
+            self.injection_count += 1
+            self.transformation_count += 1
+            self.logger.debug("Injected dead code in if-else branch")
+
+        return node
+
+    def _traverse_lua_ast_for_dead_code(self, node: Any) -> None:
+        """Recursively traverse Lua AST and inject dead code.
+
+        Args:
+            node: The Lua AST node to process.
+        """
+        if not LUAPARSER_AVAILABLE or node is None:
+            return
+
+        # Check if this is a function definition with a body
+        if isinstance(node, lua_nodes.Function):
+            body = getattr(node, 'body', None)
+            if body and self._should_inject():
+                body_stmts = getattr(body, 'body', [])
+                new_body_stmts = []
+                injected_count = 0
+
+                for i, stmt in enumerate(body_stmts):
+                    new_body_stmts.append(stmt)
+
+                    # Inject after return statements
+                    if isinstance(stmt, lua_nodes.Return):
+                        if self._should_inject():
+                            dead_count = random.randint(1, 2)
+                            dead_code = self._generate_lua_dead_code(dead_count)
+                            for dead_stmt in dead_code:
+                                new_body_stmts.append(dead_stmt)
+                                injected_count += 1
+
+                if injected_count > 0:
+                    body.body = new_body_stmts
+                    self.injection_count += injected_count
+                    self.transformation_count += injected_count
+                    self.logger.debug(f"Injected {injected_count} dead code blocks in Lua function")
+
+        # Recursively traverse child nodes
+        for attr_name in dir(node):
+            if attr_name.startswith('_'):
+                continue
+
+            attr = getattr(node, attr_name, None)
+            if attr is None:
+                continue
+
+            if isinstance(attr, list):
+                for item in attr:
+                    if hasattr(item, '__class__') and hasattr(item.__class__, '__module__'):
+                        if 'astnodes' in item.__class__.__module__:
+                            self._traverse_lua_ast_for_dead_code(item)
+            elif hasattr(attr, '__class__') and hasattr(attr.__class__, '__module__'):
+                if 'astnodes' in attr.__class__.__module__:
+                    self._traverse_lua_ast_for_dead_code(attr)
+
+    def transform(self, ast_node: ast.AST) -> TransformResult:
+        """Apply dead code injection transformation to an AST.
+
+        This method orchestrates the transformation:
+        1. Detects language from AST node type
+        2. Applies dead code injection at appropriate locations
+        3. Returns structured result
+
+        Args:
+            ast_node: The AST node to transform (ast.Module for Python,
+                     lua_nodes.Chunk for Lua).
+
+        Returns:
+            TransformResult with transformed AST, success status, and metrics.
+        """
+        # Guard against None or invalid AST types
+        if ast_node is None:
+            error_msg = "Invalid input: ast_node is None"
+            self.logger.error(error_msg)
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=0,
+                errors=[error_msg],
+            )
+
+        # Check for unsupported AST types
+        is_python_module = isinstance(ast_node, ast.Module)
+        is_lua_chunk = LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk)
+
+        if not is_python_module and not is_lua_chunk:
+            error_msg = f"Unsupported AST type: {type(ast_node).__name__}. Expected ast.Module or lua_nodes.Chunk."
+            self.logger.error(error_msg)
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=0,
+                errors=[error_msg],
+            )
+
+        # Reset state for this transformation
+        self.transformation_count = 0
+        self.errors = []
+        self.injection_count = 0
+        self._var_counter = 0
+
+        try:
+            # Detect language and apply transformations
+            if isinstance(ast_node, ast.Module):
+                self.language_mode = 'python'
+                self.logger.debug("Detected Python language mode")
+
+                # Fix missing locations before transformation
+                ast.fix_missing_locations(ast_node)
+
+                # Apply Python transformations by visiting the AST
+                transformed_node = self.visit(ast_node)
+
+                if transformed_node is None:
+                    raise ValueError("Transformation returned None")
+
+                # Fix missing locations on newly created nodes
+                ast.fix_missing_locations(transformed_node)
+
+            elif LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk):
+                self.language_mode = 'lua'
+                self.logger.debug("Detected Lua language mode")
+
+                # Apply Lua transformations using custom traversal
+                self._traverse_lua_ast_for_dead_code(ast_node)
+
+                # Lua transformation is in-place
+                transformed_node = ast_node
+
+            self.logger.info(
+                f"Dead code injection completed: "
+                f"{self.injection_count} blocks injected"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.injection_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = f"Dead code injection failed: {e.__class__.__name__}: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.injection_count,
+                errors=self.errors,
+            )
+
+
+class OpaquePredicatesTransformer(ASTTransformer):
+    """Injects opaque predicates to obfuscate control flow.
+
+    Opaque predicates are conditions that are always true or always false,
+    but appear complex enough to confuse static analysis tools. This
+    transformer wraps existing conditions with mathematically deterministic
+    predicates that preserve program semantics while making reverse
+    engineering more difficult.
+
+    The transformer supports both Python and Lua languages.
+
+    For Python, generates:
+    - Simple identities (complexity 1): x*x >= 0, abs(x) >= 0, len([]) == 0
+    - Bitwise operations (complexity 2): (x|0) == x, (x&x) == x, x^0 == x
+    - Complex expressions (complexity 3): (x*2)//2 == x, pow(x,0) == 1
+
+    For Lua, generates:
+    - Simple identities: x*x >= 0, math.abs(x) >= 0
+    - Type-specific predicates: x%1 >= 0 (number check)
+    - Complex mathematical expressions
+
+    Injection locations:
+    - If statement conditions (wrapped with AND opaque_true)
+    - While loop conditions (wrapped with AND opaque_true)
+    - For loop bodies (opaque check as first statement)
+    - Function entries (opaque variable + conditional wrapper)
+
+    Attributes:
+        config: ObfuscationConfig instance with opaque predicate options
+        opaque_predicate_complexity: Complexity level (1-3) for predicate generation
+        opaque_predicate_percentage: Probability (0-100) of injection at eligible locations
+        language_mode: Detected language ('python', 'lua', or None)
+        transformation_count: Counter for number of predicates injected
+        predicate_counter: Counter for generating unique variable names
+        errors: List of error messages collected during transformation
+
+    Example:
+        >>> from obfuscator.core.config import ObfuscationConfig
+        >>> config = ObfuscationConfig(
+        ...     name="test",
+        ...     features={"opaque_predicates": True},
+        ...     options={"opaque_predicate_complexity": 2, "opaque_predicate_percentage": 30}
+        ... )
+        >>> transformer = OpaquePredicatesTransformer(config)
+        >>> tree = ast.parse("if x > 0: print(x)")
+        >>> result = transformer.transform(tree)
+        >>> if result.success:
+        ...     print(f"Injected {result.transformation_count} opaque predicates")
+
+    Limitations:
+    - Predicates increase code size and may slightly impact performance
+    - Very high percentages (>80%) may significantly bloat code
+    - Does not inject into lambda functions or comprehensions
+    """
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        opaque_predicate_complexity: Optional[int] = None,
+        opaque_predicate_percentage: Optional[int] = None,
+    ) -> None:
+        """Initialize the opaque predicates transformer.
+
+        Args:
+            config: ObfuscationConfig instance with opaque_predicate options.
+                   If provided, extracts settings from config.options.
+            opaque_predicate_complexity: Complexity level (1-3) for predicate generation.
+                                         Overrides config if explicitly set.
+            opaque_predicate_percentage: Percentage (0-100) for injection probability.
+                                         Overrides config if explicitly set.
+        """
+        super().__init__()
+        self.logger = get_logger("obfuscator.processors.opaque_predicates")
+
+        # Determine complexity from config or parameter
+        if opaque_predicate_complexity is not None:
+            self.opaque_predicate_complexity = opaque_predicate_complexity
+        elif config is not None and hasattr(config, 'options'):
+            self.opaque_predicate_complexity = config.options.get('opaque_predicate_complexity', 2)
+        else:
+            self.opaque_predicate_complexity = 2
+
+        # Determine percentage from config or parameter
+        if opaque_predicate_percentage is not None:
+            self.opaque_predicate_percentage = opaque_predicate_percentage
+        elif config is not None and hasattr(config, 'options'):
+            self.opaque_predicate_percentage = config.options.get('opaque_predicate_percentage', 30)
+        else:
+            self.opaque_predicate_percentage = 30
+
+        # Validate and clamp ranges
+        self.opaque_predicate_complexity = max(1, min(3, self.opaque_predicate_complexity))
+        self.opaque_predicate_percentage = max(0, min(100, self.opaque_predicate_percentage))
+
+        self.config = config
+
+        # Language detection and tracking
+        self.language_mode: Optional[str] = None
+        self.predicate_counter: int = 0
+
+        self.logger.debug(
+            f"OpaquePredicatesTransformer initialized with "
+            f"complexity={self.opaque_predicate_complexity}, "
+            f"percentage={self.opaque_predicate_percentage}"
+        )
+
+    def _should_inject(self) -> bool:
+        """Determine if opaque predicate should be injected at current location.
+
+        Uses opaque_predicate_percentage to decide probabilistically.
+
+        Returns:
+            True if opaque predicate should be injected here.
+        """
+        return random.randint(0, 99) < self.opaque_predicate_percentage
+
+    def _generate_opaque_var_name(self) -> str:
+        """Generate a unique opaque variable name.
+
+        Returns:
+            Variable name like '_opaque_0', '_opaque_1', etc.
+        """
+        name = f"_opaque_{self.predicate_counter}"
+        self.predicate_counter += 1
+        return name
+
+    def _generate_python_opaque_true(self, var_name: str) -> ast.expr:
+        """Generate an always-true opaque predicate for Python.
+
+        Args:
+            var_name: The variable name to use in the predicate.
+
+        Returns:
+            AST expression node that evaluates to True.
+        """
+        complexity = self.opaque_predicate_complexity
+
+        if complexity == 1:
+            # Simple identities
+            patterns = [
+                # x * x >= 0 (square is always non-negative)
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.Mult(),
+                        right=ast.Name(id=var_name, ctx=ast.Load())
+                    ),
+                    ops=[ast.GtE()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+                # abs(x) >= 0
+                lambda: ast.Compare(
+                    left=ast.Call(
+                        func=ast.Name(id='abs', ctx=ast.Load()),
+                        args=[ast.Name(id=var_name, ctx=ast.Load())],
+                        keywords=[]
+                    ),
+                    ops=[ast.GtE()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+                # len([]) == 0
+                lambda: ast.Compare(
+                    left=ast.Call(
+                        func=ast.Name(id='len', ctx=ast.Load()),
+                        args=[ast.Constant(value=[])],
+                        keywords=[]
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+            ]
+        elif complexity == 2:
+            # Bitwise operations
+            patterns = [
+                # (x | 0) == x
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.BitOr(),
+                        right=ast.Constant(value=0)
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                ),
+                # (x & x) == x
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.BitAnd(),
+                        right=ast.Name(id=var_name, ctx=ast.Load())
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                ),
+                # x ^ 0 == x
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.BitXor(),
+                        right=ast.Constant(value=0)
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                ),
+            ]
+        else:  # complexity == 3
+            # Complex expressions
+            patterns = [
+                # (x * 2) // 2 == x or x % 2 == 1
+                lambda: ast.BoolOp(
+                    op=ast.Or(),
+                    values=[
+                        ast.Compare(
+                            left=ast.BinOp(
+                                left=ast.BinOp(
+                                    left=ast.Name(id=var_name, ctx=ast.Load()),
+                                    op=ast.Mult(),
+                                    right=ast.Constant(value=2)
+                                ),
+                                op=ast.FloorDiv(),
+                                right=ast.Constant(value=2)
+                            ),
+                            ops=[ast.Eq()],
+                            comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                        ),
+                        ast.Compare(
+                            left=ast.BinOp(
+                                left=ast.Name(id=var_name, ctx=ast.Load()),
+                                op=ast.Mod(),
+                                right=ast.Constant(value=2)
+                            ),
+                            ops=[ast.Eq()],
+                            comparators=[ast.Constant(value=1)]
+                        )
+                    ]
+                ),
+                # pow(x, 0) == 1
+                lambda: ast.Compare(
+                    left=ast.Call(
+                        func=ast.Name(id='pow', ctx=ast.Load()),
+                        args=[
+                            ast.Name(id=var_name, ctx=ast.Load()),
+                            ast.Constant(value=0)
+                        ],
+                        keywords=[]
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Constant(value=1)]
+                ),
+                # x ** 2 >= 0
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.Pow(),
+                        right=ast.Constant(value=2)
+                    ),
+                    ops=[ast.GtE()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+            ]
+
+        return random.choice(patterns)()
+
+    def _generate_python_opaque_false(self, var_name: str) -> ast.expr:
+        """Generate an always-false opaque predicate for Python.
+
+        Args:
+            var_name: The variable name to use in the predicate.
+
+        Returns:
+            AST expression node that evaluates to False.
+        """
+        complexity = self.opaque_predicate_complexity
+
+        if complexity == 1:
+            # Simple false predicates
+            patterns = [
+                # x * x < 0
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.Mult(),
+                        right=ast.Name(id=var_name, ctx=ast.Load())
+                    ),
+                    ops=[ast.Lt()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+                # len([1]) == 0
+                lambda: ast.Compare(
+                    left=ast.Call(
+                        func=ast.Name(id='len', ctx=ast.Load()),
+                        args=[ast.Constant(value=[1])],
+                        keywords=[]
+                    ),
+                    ops=[ast.Eq()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+                # abs(x) < 0
+                lambda: ast.Compare(
+                    left=ast.Call(
+                        func=ast.Name(id='abs', ctx=ast.Load()),
+                        args=[ast.Name(id=var_name, ctx=ast.Load())],
+                        keywords=[]
+                    ),
+                    ops=[ast.Lt()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+            ]
+        elif complexity == 2:
+            # Bitwise false predicates
+            patterns = [
+                # (x | 0) != x
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.BitOr(),
+                        right=ast.Constant(value=0)
+                    ),
+                    ops=[ast.NotEq()],
+                    comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                ),
+                # x ^ x != 0
+                lambda: ast.Compare(
+                    left=ast.BinOp(
+                        left=ast.Name(id=var_name, ctx=ast.Load()),
+                        op=ast.BitXor(),
+                        right=ast.Name(id=var_name, ctx=ast.Load())
+                    ),
+                    ops=[ast.NotEq()],
+                    comparators=[ast.Constant(value=0)]
+                ),
+            ]
+        else:  # complexity == 3
+            # Complex false predicates
+            patterns = [
+                # (x + 1) < x and x >= 0
+                lambda: ast.BoolOp(
+                    op=ast.And(),
+                    values=[
+                        ast.Compare(
+                            left=ast.BinOp(
+                                left=ast.Name(id=var_name, ctx=ast.Load()),
+                                op=ast.Add(),
+                                right=ast.Constant(value=1)
+                            ),
+                            ops=[ast.Lt()],
+                            comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                        ),
+                        ast.Compare(
+                            left=ast.Name(id=var_name, ctx=ast.Load()),
+                            ops=[ast.GtE()],
+                            comparators=[ast.Constant(value=0)]
+                        )
+                    ]
+                ),
+                # pow(x, 1) != x and x == x
+                lambda: ast.BoolOp(
+                    op=ast.And(),
+                    values=[
+                        ast.Compare(
+                            left=ast.Call(
+                                func=ast.Name(id='pow', ctx=ast.Load()),
+                                args=[
+                                    ast.Name(id=var_name, ctx=ast.Load()),
+                                    ast.Constant(value=1)
+                                ],
+                                keywords=[]
+                            ),
+                            ops=[ast.NotEq()],
+                            comparators=[ast.Name(id=var_name, ctx=ast.Load())]
+                        ),
+                        ast.Constant(value=True)
+                    ]
+                ),
+            ]
+
+        return random.choice(patterns)()
+
+    def _create_python_opaque_variable(self) -> tuple[ast.Assign, str]:
+        """Create an opaque variable assignment with random integer value.
+
+        Returns:
+            Tuple of (Assign AST node, variable name string).
+        """
+        var_name = self._generate_opaque_var_name()
+        assign = ast.Assign(
+            targets=[ast.Name(id=var_name, ctx=ast.Store())],
+            value=ast.Constant(value=random.randint(1, 100))
+        )
+        return assign, var_name
+
+    def _generate_lua_opaque_true(self, var_name: str) -> Any:
+        """Generate an always-true opaque predicate for Lua.
+
+        Args:
+            var_name: The variable name to use in the predicate.
+
+        Returns:
+            Lua AST expression node that evaluates to true.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        complexity = self.opaque_predicate_complexity
+
+        if complexity == 1:
+            # Simple identities
+            patterns = [
+                # x * x >= 0
+                lambda: lua_nodes.GreaterOrEqualThan(
+                    left=lua_nodes.Mult(
+                        left=lua_nodes.Name(var_name),
+                        right=lua_nodes.Name(var_name)
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+                # math.abs(x) >= 0
+                lambda: lua_nodes.GreaterOrEqualThan(
+                    left=lua_nodes.Call(
+                        func=lua_nodes.Name('math.abs'),
+                        args=[lua_nodes.Name(var_name)]
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+                # #"" == 0
+                lambda: lua_nodes.Equals(
+                    left=lua_nodes.Length(
+                        value=lua_nodes.String('')
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+            ]
+        elif complexity == 2:
+            # Medium complexity
+            patterns = [
+                # x % 1 >= 0
+                lambda: lua_nodes.GreaterOrEqualThan(
+                    left=lua_nodes.Mod(
+                        left=lua_nodes.Name(var_name),
+                        right=lua_nodes.Number(1)
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+                # type(x) == "number" or type(x) == "string"
+                lambda: lua_nodes.Or(
+                    left=lua_nodes.Equals(
+                        left=lua_nodes.Call(
+                            func=lua_nodes.Name('type'),
+                            args=[lua_nodes.Name(var_name)]
+                        ),
+                        right=lua_nodes.String('number')
+                    ),
+                    right=lua_nodes.TrueExpr()
+                ),
+            ]
+        else:  # complexity == 3
+            # Complex expressions
+            patterns = [
+                # math.pow(x, 0) == 1
+                lambda: lua_nodes.Equals(
+                    left=lua_nodes.Call(
+                        func=lua_nodes.Name('math.pow'),
+                        args=[
+                            lua_nodes.Name(var_name),
+                            lua_nodes.Number(0)
+                        ]
+                    ),
+                    right=lua_nodes.Number(1)
+                ),
+                # x ^ 2 >= 0 (using math.pow)
+                lambda: lua_nodes.GreaterOrEqualThan(
+                    left=lua_nodes.Call(
+                        func=lua_nodes.Name('math.pow'),
+                        args=[
+                            lua_nodes.Name(var_name),
+                            lua_nodes.Number(2)
+                        ]
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+            ]
+
+        return random.choice(patterns)()
+
+    def _generate_lua_opaque_false(self, var_name: str) -> Any:
+        """Generate an always-false opaque predicate for Lua.
+
+        Args:
+            var_name: The variable name to use in the predicate.
+
+        Returns:
+            Lua AST expression node that evaluates to false.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        complexity = self.opaque_predicate_complexity
+
+        if complexity == 1:
+            # Simple false predicates
+            patterns = [
+                # x * x < 0
+                lambda: lua_nodes.LesserThan(
+                    left=lua_nodes.Mult(
+                        left=lua_nodes.Name(var_name),
+                        right=lua_nodes.Name(var_name)
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+                # #"a" == 0
+                lambda: lua_nodes.Equals(
+                    left=lua_nodes.Length(
+                        value=lua_nodes.String('a')
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+            ]
+        elif complexity == 2:
+            # Medium complexity false predicates
+            patterns = [
+                # x % 1 < 0
+                lambda: lua_nodes.LesserThan(
+                    left=lua_nodes.Mod(
+                        left=lua_nodes.Name(var_name),
+                        right=lua_nodes.Number(1)
+                    ),
+                    right=lua_nodes.Number(0)
+                ),
+            ]
+        else:  # complexity == 3
+            # Complex false predicates
+            patterns = [
+                # (x + 1) < x and x >= 0
+                lambda: lua_nodes.And(
+                    left=lua_nodes.LesserThan(
+                        left=lua_nodes.Add(
+                            left=lua_nodes.Name(var_name),
+                            right=lua_nodes.Number(1)
+                        ),
+                        right=lua_nodes.Name(var_name)
+                    ),
+                    right=lua_nodes.GreaterOrEqualThan(
+                        left=lua_nodes.Name(var_name),
+                        right=lua_nodes.Number(0)
+                    )
+                ),
+            ]
+
+        return random.choice(patterns)()
+
+    def _generate_lua_opaque_true_constant(self) -> Any:
+        """Generate an always-true opaque predicate for Lua using only constants.
+
+        Returns:
+            Lua AST expression node that evaluates to true without referencing variables.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        patterns = [
+            # #"" == 0 (length of empty string is 0)
+            lambda: lua_nodes.Equals(
+                left=lua_nodes.Length(
+                    value=lua_nodes.String('')
+                ),
+                right=lua_nodes.Number(0)
+            ),
+            # 1 > 0
+            lambda: lua_nodes.GreaterThan(
+                left=lua_nodes.Number(1),
+                right=lua_nodes.Number(0)
+            ),
+            # 0 == 0
+            lambda: lua_nodes.Equals(
+                left=lua_nodes.Number(0),
+                right=lua_nodes.Number(0)
+            ),
+            # true or false
+            lambda: lua_nodes.Or(
+                left=lua_nodes.TrueExpr(),
+                right=lua_nodes.FalseExpr()
+            ),
+            # 1 + 1 == 2
+            lambda: lua_nodes.Equals(
+                left=lua_nodes.Add(
+                    left=lua_nodes.Number(1),
+                    right=lua_nodes.Number(1)
+                ),
+                right=lua_nodes.Number(2)
+            ),
+        ]
+
+        return random.choice(patterns)()
+
+    def _generate_lua_opaque_false_constant(self) -> Any:
+        """Generate an always-false opaque predicate for Lua using only constants.
+
+        Returns:
+            Lua AST expression node that evaluates to false without referencing variables.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        patterns = [
+            # #"a" == 0 (length of "a" is 1, not 0)
+            lambda: lua_nodes.Equals(
+                left=lua_nodes.Length(
+                    value=lua_nodes.String('a')
+                ),
+                right=lua_nodes.Number(0)
+            ),
+            # 0 > 1
+            lambda: lua_nodes.GreaterThan(
+                left=lua_nodes.Number(0),
+                right=lua_nodes.Number(1)
+            ),
+            # 0 ~= 0
+            lambda: lua_nodes.NotEquals(
+                left=lua_nodes.Number(0),
+                right=lua_nodes.Number(0)
+            ),
+            # true and false
+            lambda: lua_nodes.And(
+                left=lua_nodes.TrueExpr(),
+                right=lua_nodes.FalseExpr()
+            ),
+            # 1 + 1 == 3
+            lambda: lua_nodes.Equals(
+                left=lua_nodes.Add(
+                    left=lua_nodes.Number(1),
+                    right=lua_nodes.Number(1)
+                ),
+                right=lua_nodes.Number(3)
+            ),
+        ]
+
+        return random.choice(patterns)()
+
+    def _wrap_lua_condition_with_opaque_constant(self, condition: Any, use_false: bool = False) -> Any:
+        """Wrap a Lua condition with a constant-only opaque predicate.
+
+        Args:
+            condition: Original Lua condition expression.
+            use_false: If True, use always-false predicate in OR pattern.
+
+        Returns:
+            Wrapped Lua condition expression using only constant predicates.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return condition
+
+        if use_false:
+            opaque_false = self._generate_lua_opaque_false_constant()
+            opaque_true = self._generate_lua_opaque_true_constant()
+            # Pattern: (True and original) or False -> preserves original semantics
+            wrapped = lua_nodes.Or(
+                left=lua_nodes.And(
+                    left=opaque_true,
+                    right=condition
+                ),
+                right=opaque_false
+            )
+        else:
+            opaque_predicate = self._generate_lua_opaque_true_constant()
+            # Create: opaque_predicate and original_condition
+            wrapped = lua_nodes.And(
+                left=opaque_predicate,
+                right=condition
+            )
+
+        return wrapped
+
+    def _generate_python_opaque_true_constant(self) -> ast.expr:
+        """Generate an always-true opaque predicate for Python using only constants.
+
+        Returns:
+            AST expression node that evaluates to True without referencing variables.
+        """
+        patterns = [
+            # len([]) == 0
+            lambda: ast.Compare(
+                left=ast.Call(
+                    func=ast.Name(id='len', ctx=ast.Load()),
+                    args=[ast.Constant(value=[])],
+                    keywords=[]
+                ),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=0)]
+            ),
+            # len([1, 2]) > 0
+            lambda: ast.Compare(
+                left=ast.Call(
+                    func=ast.Name(id='len', ctx=ast.Load()),
+                    args=[ast.Constant(value=[1, 2])],
+                    keywords=[]
+                ),
+                ops=[ast.Gt()],
+                comparators=[ast.Constant(value=0)]
+            ),
+            # 1 > 0
+            lambda: ast.Compare(
+                left=ast.Constant(value=1),
+                ops=[ast.Gt()],
+                comparators=[ast.Constant(value=0)]
+            ),
+            # 0 == 0
+            lambda: ast.Compare(
+                left=ast.Constant(value=0),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=0)]
+            ),
+            # True or False
+            lambda: ast.BoolOp(
+                op=ast.Or(),
+                values=[ast.Constant(value=True), ast.Constant(value=False)]
+            ),
+            # 1 + 1 == 2
+            lambda: ast.Compare(
+                left=ast.BinOp(
+                    left=ast.Constant(value=1),
+                    op=ast.Add(),
+                    right=ast.Constant(value=1)
+                ),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=2)]
+            ),
+        ]
+
+        return random.choice(patterns)()
+
+    def _generate_python_opaque_false_constant(self) -> ast.expr:
+        """Generate an always-false opaque predicate for Python using only constants.
+
+        Returns:
+            AST expression node that evaluates to False without referencing variables.
+        """
+        patterns = [
+            # len([1]) == 0
+            lambda: ast.Compare(
+                left=ast.Call(
+                    func=ast.Name(id='len', ctx=ast.Load()),
+                    args=[ast.Constant(value=[1])],
+                    keywords=[]
+                ),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=0)]
+            ),
+            # 0 > 1
+            lambda: ast.Compare(
+                left=ast.Constant(value=0),
+                ops=[ast.Gt()],
+                comparators=[ast.Constant(value=1)]
+            ),
+            # 0 != 0
+            lambda: ast.Compare(
+                left=ast.Constant(value=0),
+                ops=[ast.NotEq()],
+                comparators=[ast.Constant(value=0)]
+            ),
+            # True and False
+            lambda: ast.BoolOp(
+                op=ast.And(),
+                values=[ast.Constant(value=True), ast.Constant(value=False)]
+            ),
+            # 1 + 1 == 3
+            lambda: ast.Compare(
+                left=ast.BinOp(
+                    left=ast.Constant(value=1),
+                    op=ast.Add(),
+                    right=ast.Constant(value=1)
+                ),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(value=3)]
+            ),
+        ]
+
+        return random.choice(patterns)()
+
+    def _wrap_condition_with_opaque_python_constant(
+        self, condition: ast.expr, use_false: bool = False
+    ) -> ast.expr:
+        """Wrap a condition with a constant-only opaque predicate using AND/OR.
+
+        Args:
+            condition: Original condition expression.
+            use_false: If True, use always-false predicate in OR pattern.
+
+        Returns:
+            Wrapped condition expression using only constant predicates.
+        """
+        if use_false:
+            opaque_false = self._generate_python_opaque_false_constant()
+            opaque_true = self._generate_python_opaque_true_constant()
+            # Pattern: (True and original) or False -> preserves original semantics
+            wrapped = ast.BoolOp(
+                op=ast.Or(),
+                values=[
+                    ast.BoolOp(
+                        op=ast.And(),
+                        values=[opaque_true, condition]
+                    ),
+                    opaque_false
+                ]
+            )
+        else:
+            opaque_predicate = self._generate_python_opaque_true_constant()
+            # Create: opaque_predicate and original_condition
+            wrapped = ast.BoolOp(
+                op=ast.And(),
+                values=[opaque_predicate, condition]
+            )
+
+        return wrapped
+
+    def visit_If(self, node: ast.If) -> ast.AST:
+        """Visit and potentially wrap if condition with opaque predicate.
+
+        Args:
+            node: The If AST node to potentially transform.
+
+        Returns:
+            Transformed node with opaque predicate wrapping the condition.
+        """
+        # First visit children for nested transformations
+        self.generic_visit(node)
+
+        # Decide whether to inject based on percentage
+        if self._should_inject():
+            # Randomly choose between true and false predicates
+            use_false = random.choice([True, False])
+            # Use constant-only predicates for if conditions (no variable assignment needed)
+            wrapped_test = self._wrap_condition_with_opaque_python_constant(node.test, use_false=use_false)
+            node.test = wrapped_test
+            ast.fix_missing_locations(node.test)
+            self.transformation_count += 1
+            self.logger.debug(f"Wrapped if condition with opaque predicate (false={use_false})")
+
+        return node
+
+    def visit_While(self, node: ast.While) -> ast.AST:
+        """Visit and potentially wrap while condition with opaque predicate.
+
+        Args:
+            node: The While AST node to potentially transform.
+
+        Returns:
+            Transformed node with opaque predicate wrapping the condition.
+        """
+        # Visit children first
+        self.generic_visit(node)
+
+        # Decide whether to inject based on percentage
+        if self._should_inject():
+            # Randomly choose between true and false predicates
+            use_false = random.choice([True, False])
+            # Use constant-only predicates for while conditions (no variable assignment needed)
+            wrapped_test = self._wrap_condition_with_opaque_python_constant(node.test, use_false=use_false)
+            node.test = wrapped_test
+            ast.fix_missing_locations(node.test)
+            self.transformation_count += 1
+            self.logger.debug(f"Wrapped while condition with opaque predicate (false={use_false})")
+
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.AST:
+        """Visit and inject opaque predicate check into for loop body.
+
+        Args:
+            node: The For AST node to potentially transform.
+
+        Returns:
+            Transformed node with opaque predicate as first statement.
+        """
+        # Visit children first
+        self.generic_visit(node)
+
+        # Decide whether to inject based on percentage
+        if self._should_inject():
+            # Create opaque variable first
+            opaque_var, var_name = self._create_python_opaque_variable()
+            ast.fix_missing_locations(opaque_var)
+
+            # Randomly choose between true and false predicates
+            use_false = random.choice([True, False])
+            if use_false:
+                opaque_test = self._generate_python_opaque_false(var_name)
+                # Insert a dummy false branch: if opaque_false: pass
+                # This ensures the false predicate is actually emitted
+                opaque_check = ast.If(
+                    test=opaque_test,
+                    body=[ast.Pass()],
+                    orelse=node.body
+                )
+            else:
+                opaque_test = self._generate_python_opaque_true(var_name)
+                opaque_check = ast.If(
+                    test=opaque_test,
+                    body=node.body,
+                    orelse=[]
+                )
+            ast.fix_missing_locations(opaque_check)
+
+            # Replace body with the opaque-check-wrapped version
+            node.body = [opaque_var, opaque_check]
+            self.transformation_count += 1
+            self.logger.debug(f"Injected opaque predicate in for loop body (false={use_false})")
+
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        """Visit and inject opaque predicate at function entry.
+
+        Args:
+            node: The FunctionDef AST node to potentially transform.
+
+        Returns:
+            Transformed node with opaque variable and predicate check.
+        """
+        # Visit children first for nested transformations
+        self.generic_visit(node)
+
+        # Decide whether to inject based on percentage
+        if self._should_inject():
+            # Create opaque variable assignment
+            opaque_var, var_name = self._create_python_opaque_variable()
+            ast.fix_missing_locations(opaque_var)
+
+            # Randomly choose between true and false predicates
+            use_false = random.choice([True, False])
+            if use_false:
+                opaque_test = self._generate_python_opaque_false(var_name)
+                # Insert a dummy false branch: if opaque_false: pass
+                opaque_check = ast.If(
+                    test=opaque_test,
+                    body=[ast.Pass()],
+                    orelse=node.body
+                )
+            else:
+                opaque_test = self._generate_python_opaque_true(var_name)
+                opaque_check = ast.If(
+                    test=opaque_test,
+                    body=node.body,
+                    orelse=[]
+                )
+            ast.fix_missing_locations(opaque_check)
+
+            # Prepend opaque variable and wrap body
+            node.body = [opaque_var, opaque_check]
+            self.transformation_count += 1
+            self.logger.debug(f"Injected opaque predicate at function entry (false={use_false})")
+
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        """Visit async function definition - apply same opaque predicate injection.
+
+        Args:
+            node: The AsyncFunctionDef AST node.
+
+        Returns:
+            Transformed node with opaque predicate injected.
+        """
+        # Visit children first for nested transformations
+        self.generic_visit(node)
+
+        # Decide whether to inject based on percentage
+        if self._should_inject():
+            # Create opaque variable assignment
+            opaque_var, var_name = self._create_python_opaque_variable()
+            ast.fix_missing_locations(opaque_var)
+
+            # Randomly choose between true and false predicates
+            use_false = random.choice([True, False])
+            if use_false:
+                opaque_test = self._generate_python_opaque_false(var_name)
+                # Insert a dummy false branch: if opaque_false: pass
+                opaque_check = ast.If(
+                    test=opaque_test,
+                    body=[ast.Pass()],
+                    orelse=node.body
+                )
+            else:
+                opaque_test = self._generate_python_opaque_true(var_name)
+                opaque_check = ast.If(
+                    test=opaque_test,
+                    body=node.body,
+                    orelse=[]
+                )
+            ast.fix_missing_locations(opaque_check)
+
+            # Prepend opaque variable and wrap body
+            node.body = [opaque_var, opaque_check]
+            self.transformation_count += 1
+            self.logger.debug(f"Injected opaque predicate at async function entry (false={use_false})")
+
+        return node
+
+    def _traverse_lua_ast_for_opaque_predicates(self, node: Any) -> None:
+        """Recursively traverse Lua AST and inject opaque predicates.
+
+        Args:
+            node: The Lua AST node to process.
+        """
+        if not LUAPARSER_AVAILABLE or node is None:
+            return
+
+        # Check if this is an If statement
+        if isinstance(node, lua_nodes.If):
+            if self._should_inject():
+                # Randomly choose between true and false predicates
+                use_false = random.choice([True, False])
+                # Use constant-only predicates for if conditions (no variable assignment needed)
+                node.test = self._wrap_lua_condition_with_opaque_constant(node.test, use_false=use_false)
+                self.transformation_count += 1
+                self.logger.debug(f"Wrapped Lua if condition with opaque predicate (false={use_false})")
+
+        # Check if this is a While loop
+        elif isinstance(node, lua_nodes.While):
+            if self._should_inject():
+                # Randomly choose between true and false predicates
+                use_false = random.choice([True, False])
+                # Use constant-only predicates for while conditions (no variable assignment needed)
+                node.test = self._wrap_lua_condition_with_opaque_constant(node.test, use_false=use_false)
+                self.transformation_count += 1
+                self.logger.debug(f"Wrapped Lua while condition with opaque predicate (false={use_false})")
+
+        # Check if this is a For loop
+        elif isinstance(node, lua_nodes.For):
+            if self._should_inject():
+                # Create opaque variable first
+                var_name = self._generate_opaque_var_name()
+                opaque_assign = lua_nodes.LocalAssign(
+                    targets=[lua_nodes.Name(var_name)],
+                    values=[lua_nodes.Number(random.randint(1, 100))]
+                )
+
+                body = getattr(node, 'body', None)
+                if body and hasattr(body, 'body'):
+                    # Randomly choose between true and false predicates
+                    use_false = random.choice([True, False])
+                    if use_false:
+                        opaque_test = self._generate_lua_opaque_false(var_name)
+                        # Insert a dummy false branch: if opaque_false then end
+                        # This ensures the false predicate is actually emitted
+                        dummy_block = lua_nodes.Block([])
+                        opaque_if = lua_nodes.If(
+                            test=opaque_test,
+                            body=dummy_block,
+                            orelse=body
+                        )
+                    else:
+                        opaque_test = self._generate_lua_opaque_true(var_name)
+                        opaque_if = lua_nodes.If(
+                            test=opaque_test,
+                            body=body,
+                            orelse=lua_nodes.Block([])
+                        )
+                    node.body = lua_nodes.Block([opaque_assign, opaque_if])
+                    self.transformation_count += 1
+                    self.logger.debug(f"Injected opaque predicate in Lua for loop body (false={use_false})")
+
+        # Check if this is a Function definition
+        elif isinstance(node, lua_nodes.Function):
+            if self._should_inject():
+                body = getattr(node, 'body', None)
+                if body and hasattr(body, 'body'):
+                    body_stmts = list(body.body)
+
+                    # Create opaque variable assignment
+                    var_name = self._generate_opaque_var_name()
+                    opaque_assign = lua_nodes.LocalAssign(
+                        targets=[lua_nodes.Name(var_name)],
+                        values=[lua_nodes.Number(random.randint(1, 100))]
+                    )
+
+                    # Randomly choose between true and false predicates
+                    use_false = random.choice([True, False])
+                    if use_false:
+                        opaque_test = self._generate_lua_opaque_false(var_name)
+                        # Insert a dummy false branch: if opaque_false then end
+                        dummy_block = lua_nodes.Block([])
+                        wrapped_body = lua_nodes.Block(body_stmts)
+                        opaque_if = lua_nodes.If(
+                            test=opaque_test,
+                            body=dummy_block,
+                            orelse=wrapped_body
+                        )
+                    else:
+                        opaque_test = self._generate_lua_opaque_true(var_name)
+                        wrapped_body = lua_nodes.Block(body_stmts)
+                        opaque_if = lua_nodes.If(
+                            test=opaque_test,
+                            body=wrapped_body,
+                            orelse=lua_nodes.Block([])
+                        )
+
+                    # Prepend opaque variable and wrap body
+                    new_body = [opaque_assign, opaque_if]
+                    body.body = new_body
+                    self.transformation_count += 1
+                    self.logger.debug(f"Injected opaque predicate at Lua function entry (false={use_false})")
+
+        # Recursively traverse child nodes
+        for attr_name in dir(node):
+            if attr_name.startswith('_'):
+                continue
+
+            attr = getattr(node, attr_name, None)
+            if attr is None:
+                continue
+
+            if isinstance(attr, list):
+                for item in attr:
+                    if hasattr(item, '__class__') and hasattr(item.__class__, '__module__'):
+                        if 'astnodes' in item.__class__.__module__:
+                            self._traverse_lua_ast_for_opaque_predicates(item)
+            elif hasattr(attr, '__class__') and hasattr(attr.__class__, '__module__'):
+                if 'astnodes' in attr.__class__.__module__:
+                    self._traverse_lua_ast_for_opaque_predicates(attr)
+
+    def transform(self, ast_node: ast.AST) -> TransformResult:
+        """Apply opaque predicate transformation to an AST.
+
+        This method orchestrates the transformation:
+        1. Detects language from AST node type
+        2. Applies opaque predicates at appropriate locations
+        3. Returns structured result
+
+        Args:
+            ast_node: The AST node to transform (ast.Module for Python,
+                     lua_nodes.Chunk for Lua).
+
+        Returns:
+            TransformResult with transformed AST, success status, and metrics.
+        """
+        # Guard against None or invalid AST types
+        if ast_node is None:
+            error_msg = "Invalid input: ast_node is None"
+            self.logger.error(error_msg)
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=0,
+                errors=[error_msg],
+            )
+
+        # Check for unsupported AST types
+        is_python_module = isinstance(ast_node, ast.Module)
+        is_lua_chunk = LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk)
+
+        if not is_python_module and not is_lua_chunk:
+            error_msg = f"Unsupported AST type: {type(ast_node).__name__}. Expected ast.Module or lua_nodes.Chunk."
+            self.logger.error(error_msg)
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=0,
+                errors=[error_msg],
+            )
+
+        # Reset state for this transformation
+        self.transformation_count = 0
+        self.errors = []
+        self.predicate_counter = 0
+
+        try:
+            # Detect language and apply transformations
+            if isinstance(ast_node, ast.Module):
+                self.language_mode = 'python'
+                self.logger.debug("Detected Python language mode")
+
+                # Fix missing locations before transformation
+                ast.fix_missing_locations(ast_node)
+
+                # Apply Python transformations by visiting the AST
+                transformed_node = self.visit(ast_node)
+
+                if transformed_node is None:
+                    raise ValueError("Transformation returned None")
+
+                # Fix missing locations on newly created nodes
+                ast.fix_missing_locations(transformed_node)
+
+            elif LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk):
+                self.language_mode = 'lua'
+                self.logger.debug("Detected Lua language mode")
+
+                # Apply Lua transformations using custom traversal
+                self._traverse_lua_ast_for_opaque_predicates(ast_node)
+
+                # Lua transformation is in-place
+                transformed_node = ast_node
+
+            self.logger.info(
+                f"Opaque predicates injection completed: "
+                f"{self.transformation_count} predicates injected"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = f"Opaque predicates injection failed: {e.__class__.__name__}: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+

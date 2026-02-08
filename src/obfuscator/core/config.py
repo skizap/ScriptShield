@@ -44,6 +44,7 @@ GUI_TO_JSON_FEATURE_MAP = {
     "Anti-Debug": "anti_debugging",
     "VM Protection": "vm_protection",
     "Bytecode Compilation": "code_splitting",
+    "Index Mangling": "mangle_indexes",
     "Roblox API Preservation": "roblox_exploit_defense",
     "Luau Type Stripping": "roblox_remote_spy",
 }
@@ -51,6 +52,7 @@ GUI_TO_JSON_FEATURE_MAP = {
 # Valid feature names from JSON schema
 VALID_FEATURES = {
     "mangle_globals",
+    "mangle_indexes",
     "string_encryption",
     "number_obfuscation",
     "dead_code_injection",
@@ -86,6 +88,23 @@ class ObfuscationConfig:
         features: Dictionary of feature flags (feature_name -> enabled)
         options: Dictionary of additional options with default values
         symbol_table_options: Configuration for the global symbol table
+
+    Features:
+        mangle_globals: Rename global functions, classes, and variables
+            - Renames all global symbols with generated identifiers
+            - Preserves language builtins and reserved names
+            - Maintains cross-file consistency via GlobalSymbolTable
+            - Respects preserve_exports and preserve_constants flags
+            - Handles both Python and Lua with language-specific rules
+            
+    Symbol Table Options:
+        identifier_prefix: Prefix for mangled names (default: "_0x")
+        mangling_strategy: "sequential" | "random" | "minimal"
+            - sequential: _0x1, _0x2, _0x3, ... (deterministic)
+            - random: _0xa3f2, _0x7b1c, ... (non-deterministic)
+            - minimal: a, b, c, ..., aa, ab, ... (shortest names)
+        preserve_exports: If True, exported symbols keep original names
+        preserve_constants: If True, ALL_CAPS variables keep original names
     """
 
     name: str
@@ -105,6 +124,8 @@ class ObfuscationConfig:
         "vm_protect_all_functions": False,
         "vm_bytecode_encryption": True,
         "vm_protection_marker": "vm_protect",
+        "opaque_predicate_complexity": 2,
+        "opaque_predicate_percentage": 30,
     })
     symbol_table_options: Dict[str, Any] = field(default_factory=lambda: {
         "identifier_prefix": "_0x",
@@ -242,6 +263,29 @@ class ObfuscationConfig:
                     "Option 'vm_protection_marker' must be a string"
                 )
 
+        # Opaque predicates options validation
+        if "opaque_predicate_complexity" in self.options:
+            complexity = self.options["opaque_predicate_complexity"]
+            if not isinstance(complexity, int):
+                raise ValueError(
+                    "Option 'opaque_predicate_complexity' must be an integer"
+                )
+            if not 1 <= complexity <= 3:
+                raise ValueError(
+                    "Option 'opaque_predicate_complexity' must be between 1 and 3"
+                )
+
+        if "opaque_predicate_percentage" in self.options:
+            percentage = self.options["opaque_predicate_percentage"]
+            if not isinstance(percentage, int):
+                raise ValueError(
+                    "Option 'opaque_predicate_percentage' must be an integer"
+                )
+            if not 0 <= percentage <= 100:
+                raise ValueError(
+                    "Option 'opaque_predicate_percentage' must be between 0 and 100"
+                )
+
         # Check symbol_table_options
         valid_strategies = {"sequential", "random", "minimal"}
         if "mangling_strategy" in self.symbol_table_options:
@@ -338,6 +382,8 @@ class ObfuscationConfig:
                     "vm_protect_all_functions": False,
                     "vm_bytecode_encryption": True,
                     "vm_protection_marker": "vm:protect",
+                    "opaque_predicate_complexity": 2,
+                    "opaque_predicate_percentage": 30,
                 }),
                 symbol_table_options=data.get("symbol_table_options", {
                     "identifier_prefix": "_0x",
@@ -407,6 +453,8 @@ class ObfuscationConfig:
                 "vm_protect_all_functions": False,
                 "vm_bytecode_encryption": True,
                 "vm_protection_marker": "vm:protect",
+                "opaque_predicate_complexity": 2,
+                "opaque_predicate_percentage": 30,
             },
             symbol_table_options={
                 "identifier_prefix": "_0x",

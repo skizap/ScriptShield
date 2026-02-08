@@ -54,6 +54,7 @@ from obfuscator.utils.logger import get_logger
 # Import for type checking only to avoid circular imports
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from obfuscator.core.config import ObfuscationConfig
     from obfuscator.core.symbol_table import GlobalSymbolTable
 
 logger = get_logger("obfuscator.processors.python_processor")
@@ -193,12 +194,19 @@ class PythonProcessor:
         cycle. This is a fundamental limitation of AST-based code processing.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: "ObfuscationConfig | None" = None) -> None:
         """Initialize the Python processor.
 
         Creates a new PythonProcessor instance ready to parse files
         and generate code.
+
+        Args:
+            config: Optional ObfuscationConfig instance. When provided,
+                    the engine will apply additional transformations
+                    (string encryption, number obfuscation, etc.) after
+                    name mangling in ``obfuscate_with_symbol_table()``.
         """
+        self._config = config
         logger.debug("PythonProcessor initialized")
 
     def parse_file(self, file_path: Path | str) -> ParseResult:
@@ -607,20 +615,75 @@ class PythonProcessor:
         path = Path(file_path) if isinstance(file_path, str) else file_path
 
         try:
-            # Create the name mangling transformer
-            transformer = NameManglingTransformer(global_table, path)
-
-            # Apply the transformation
-            result = transformer.transform(ast_node)
-
-            if result.success:
-                logger.info(
-                    f"Successfully obfuscated {path.name} using GlobalSymbolTable"
+            # Check whether name mangling is enabled via mangle_globals flag.
+            # Default to True when no config is provided (backward compat).
+            mangle_enabled = True
+            if self._config is not None:
+                mangle_enabled = self._config.features.get(
+                    "mangle_globals", True
                 )
+
+            if mangle_enabled:
+                # Create the name mangling transformer
+                transformer = NameManglingTransformer(global_table, path)
+
+                # Apply the transformation
+                result = transformer.transform(ast_node)
+
+                if result.success:
+                    logger.info(
+                        f"Successfully obfuscated {path.name} using GlobalSymbolTable"
+                    )
+                else:
+                    logger.warning(
+                        f"Obfuscation of {path.name} completed with errors: {result.errors}"
+                    )
+                    return result
             else:
-                logger.warning(
-                    f"Obfuscation of {path.name} completed with errors: {result.errors}"
+                logger.info(
+                    f"Name mangling disabled for {path.name}; skipping NameManglingTransformer"
                 )
+                result = TransformResult(
+                    ast_node=ast_node,
+                    success=True,
+                    transformation_count=0,
+                    errors=[],
+                )
+
+            # Apply additional transformations via ObfuscationEngine if config exists
+            if self._config is not None and result.ast_node is not None:
+                from obfuscator.core.obfuscation_engine import ObfuscationEngine
+
+                engine = ObfuscationEngine(self._config)
+                engine_result = engine.apply_transformations(
+                    result.ast_node, "python", path
+                )
+
+                if engine_result.success:
+                    logger.info(
+                        f"Engine transformations succeeded for {path.name}: "
+                        f"{engine_result.transformation_count} additional transformations"
+                    )
+                    return TransformResult(
+                        ast_node=engine_result.ast_node,
+                        success=True,
+                        transformation_count=(
+                            result.transformation_count
+                            + engine_result.transformation_count
+                        ),
+                        errors=result.errors + engine_result.errors,
+                    )
+                else:
+                    logger.error(
+                        f"Engine transformations failed for {path.name}: "
+                        f"{engine_result.errors}"
+                    )
+                    return TransformResult(
+                        ast_node=result.ast_node,
+                        success=False,
+                        transformation_count=result.transformation_count,
+                        errors=result.errors + engine_result.errors,
+                    )
 
             return result
 
@@ -894,6 +957,27 @@ class NameManglingTransformer(ASTTransformer):
         >>> result = transformer.transform(ast_node)
         >>> if result.success:
         ...     print("Transformation successful")
+
+    Limitations and Edge Cases:
+        1. Dynamic imports: Cannot track symbols from __import__(), importlib, or exec()
+        2. String-based access: Cannot mangle symbols accessed via getattr(obj, "name")
+        3. Reflection: Cannot handle inspect module or __dict__ access patterns
+        4. Eval/exec: Code in eval() or exec() strings is not analyzed
+        5. C extensions: Cannot mangle symbols from compiled extensions
+        6. Type annotations: Forward references in quotes may break if mangled
+        
+    Cross-File Consistency:
+        - Requires GlobalSymbolTable to be frozen before transformation
+        - Files must be processed in topological order from DependencyGraph
+        - Circular dependencies fall back to original file order (may affect consistency)
+        
+    Preserved Symbols:
+        - Python builtins (print, len, str, etc.)
+        - Python keywords (if, for, class, def, etc.)
+        - Magic methods (__init__, __str__, etc.)
+        - Dunder names (__name__, __file__, etc.)
+        - Symbols marked with is_exported=True (if preserve_exports config enabled)
+        - ALL_CAPS constants (if preserve_constants config enabled)
     """
 
     def __init__(self, global_table: "GlobalSymbolTable", file_path: Path) -> None:
@@ -911,6 +995,10 @@ class NameManglingTransformer(ASTTransformer):
         # Track locally bound identifiers per scope to avoid incorrect global fallback
         # Maps scope depth to set of locally bound names (parameters, assignments, etc.)
         self._local_bindings: dict[int, set[str]] = {}
+        # Track import name mappings: original_name -> mangled_name for cross-file refs
+        self._import_name_mapping: dict[str, str] = {}
+        # Track module-level imports for attribute access resolution
+        self._module_imports: set[str] = set()
 
     def _get_current_scope(self) -> str:
         """Get the current scope for symbol lookup.
@@ -955,8 +1043,102 @@ class NameManglingTransformer(ASTTransformer):
         # Return original name if not found in symbol table
         return name
 
+    def _find_cross_file_mangled_name(self, name: str) -> str | None:
+        """Search all files in the global table for a mangled name.
+
+        Looks up a symbol by original_name in global scope across all files.
+        Used for resolving imported symbols and attribute accesses.
+
+        Args:
+            name: Original symbol name to look up
+
+        Returns:
+            Mangled name if found (and different from original), None otherwise
+        """
+        for entry in self.global_table.get_all_symbols():
+            if entry.original_name == name and entry.scope == "global":
+                if entry.mangled_name != name:
+                    return entry.mangled_name
+        return None
+
+    def visit_Import(self, node: ast.Import) -> ast.Import:
+        """Transform Import nodes by tracking module names for attribute resolution.
+
+        Records module names so visit_Attribute can mangle member accesses
+        like ``utils.calculate_sum`` when ``calculate_sum`` is a global symbol.
+
+        Args:
+            node: Import AST node
+
+        Returns:
+            The Import node (unchanged, but module names are tracked)
+        """
+        for alias in node.names:
+            local_name = alias.asname or alias.name
+            self._module_imports.add(local_name)
+        return node
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        """Transform ImportFrom nodes by mapping imported names to mangled counterparts.
+
+        For ``from module_a import helper_function``, looks up ``helper_function``
+        in the GlobalSymbolTable (using the defining file path and global scope)
+        and rewrites the alias name to the mangled identifier. Also tracks the
+        mapping so that subsequent Name references are updated consistently.
+
+        Args:
+            node: ImportFrom AST node
+
+        Returns:
+            Transformed ImportFrom node with mangled import names
+        """
+        if node.names:
+            for alias in node.names:
+                if alias.name == '*':
+                    continue
+                original_name = alias.name
+                mangled = self._find_cross_file_mangled_name(original_name)
+                if mangled and mangled != original_name:
+                    logger.debug(
+                        f"Mangling ImportFrom: {original_name} -> {mangled}"
+                    )
+                    alias.name = mangled
+                    if alias.asname is None:
+                        self._import_name_mapping[original_name] = mangled
+        return node
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.Attribute:
+        """Transform Attribute nodes by mangling attr for global symbol references.
+
+        For ``utils.calculate_sum``, if ``utils`` is an imported module and
+        ``calculate_sum`` is a global symbol in the GlobalSymbolTable, rewrites
+        ``attr`` to the mangled identifier. Leaves preserved/built-in names intact.
+
+        Args:
+            node: Attribute AST node
+
+        Returns:
+            Transformed Attribute node with mangled attr
+        """
+        # Visit the value sub-expression first
+        node.value = self.visit(node.value)
+
+        # Only mangle attributes on imported modules
+        if isinstance(node.value, ast.Name) and node.value.id in self._module_imports:
+            mangled = self._find_cross_file_mangled_name(node.attr)
+            if mangled and mangled != node.attr:
+                logger.debug(
+                    f"Mangling Attribute: {node.attr} -> {mangled}"
+                )
+                node.attr = mangled
+
+        return node
+
     def visit_Name(self, node: ast.Name) -> ast.Name:
         """Transform Name nodes by replacing with mangled names.
+
+        Checks the import name mapping first (for cross-file from-import
+        bindings), then falls back to the normal symbol table lookup.
 
         Args:
             node: Name AST node
@@ -964,6 +1146,13 @@ class NameManglingTransformer(ASTTransformer):
         Returns:
             Transformed Name node with mangled id
         """
+        # Check import mapping first for cross-file from-import bindings
+        if node.id in self._import_name_mapping:
+            mangled = self._import_name_mapping[node.id]
+            logger.debug(f"Mangling Name (import mapping): {node.id} -> {mangled}")
+            node.id = mangled
+            return node
+
         mangled = self._try_mangle_name(node.id)
         if mangled != node.id:
             logger.debug(f"Mangling Name: {node.id} -> {mangled}")

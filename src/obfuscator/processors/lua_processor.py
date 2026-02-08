@@ -39,6 +39,7 @@ import luaparser.astnodes
 from obfuscator.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from obfuscator.core.config import ObfuscationConfig
     from obfuscator.core.symbol_table import GlobalSymbolTable
 from obfuscator.processors.luau_extensions import (
     LuauCodeGenerator,
@@ -154,7 +155,12 @@ class LuaProcessor:
         >>> parse_result = processor.parse_file("script.luau")
     """
 
-    def __init__(self, enable_luau: bool = False, debug_mode: bool = False) -> None:
+    def __init__(
+        self,
+        enable_luau: bool = False,
+        debug_mode: bool = False,
+        config: "ObfuscationConfig | None" = None,
+    ) -> None:
         """Initialize the Lua processor.
 
         Args:
@@ -163,10 +169,15 @@ class LuaProcessor:
                          restored during code generation.
             debug_mode: If True, enables debug output for Luau processing,
                         including comments indicating stripped/restored annotations.
+            config: Optional ObfuscationConfig instance. When provided,
+                    the engine will apply additional transformations
+                    (string encryption, number obfuscation, etc.) after
+                    name mangling in ``obfuscate_with_symbol_table()``.
         """
         self.logger = get_logger("obfuscator.processors.lua_processor")
         self.enable_luau = enable_luau
         self.debug_mode = debug_mode
+        self._config = config
         self._luau_preprocessor: Optional[LuauPreprocessor] = None
         self._luau_generator: Optional[LuauCodeGenerator] = None
         self._luajit_detector: Optional[LuaJITDetector] = None
@@ -624,9 +635,50 @@ class LuaProcessor:
         path = Path(file_path) if isinstance(file_path, str) else file_path
 
         try:
-            # Create the name mangling visitor and apply transformations
-            visitor = LuaNameManglingVisitor(global_table, path)
-            visitor.visit(ast_node)
+            # Check whether name mangling is enabled via mangle_globals flag.
+            # Default to True when no config is provided (backward compat).
+            mangle_enabled = True
+            if self._config is not None:
+                mangle_enabled = self._config.features.get(
+                    "mangle_globals", True
+                )
+
+            if mangle_enabled:
+                # Create the name mangling visitor and apply transformations
+                visitor = LuaNameManglingVisitor(global_table, path)
+                visitor.visit(ast_node)
+            else:
+                self.logger.info(
+                    f"Name mangling disabled for {path.name}; skipping LuaNameManglingVisitor"
+                )
+
+            # Apply additional transformations via ObfuscationEngine if config exists
+            if self._config is not None:
+                from obfuscator.core.obfuscation_engine import ObfuscationEngine
+
+                engine = ObfuscationEngine(self._config)
+                engine_result = engine.apply_transformations(
+                    ast_node, "lua", path
+                )
+
+                if engine_result.success:
+                    self.logger.info(
+                        f"Engine transformations succeeded for {path.name}: "
+                        f"{engine_result.transformation_count} additional transformations"
+                    )
+                    # Use the engine-transformed AST for code generation
+                    ast_node = engine_result.ast_node
+                else:
+                    self.logger.error(
+                        f"Engine transformations failed for {path.name}: "
+                        f"{engine_result.errors}"
+                    )
+                    return GenerateResult(
+                        code="",
+                        success=False,
+                        errors=engine_result.errors,
+                        warnings=[],
+                    )
 
             # Generate code from the transformed AST
             gen_result = self.generate_code(ast_node)
@@ -653,6 +705,75 @@ class LuaProcessor:
                 metadata={"error": str(e)}
             )
 
+    def apply_transformations(
+        self,
+        ast_node: luaparser.astnodes.Chunk,
+        transformers: list[Any],
+    ) -> GenerateResult:
+        """Apply a pipeline of AST transformations to a Lua chunk.
+
+        Applies each transformer in sequence to the AST, accumulating results.
+        Validates the Lua AST by attempting code generation after all
+        transformations complete.
+
+        Args:
+            ast_node: The Lua AST Chunk node to transform.
+            transformers: List of transformer instances to apply in sequence.
+                         Each must have a ``transform()`` method returning a
+                         ``TransformResult``.
+
+        Returns:
+            GenerateResult containing the generated code if successful,
+            or error messages if any transformation or validation failed.
+        """
+        if not transformers:
+            return self.generate_code(ast_node)
+
+        current_ast = ast_node
+        total_count = 0
+        all_errors: list[str] = []
+
+        for idx, transformer in enumerate(transformers):
+            name = type(transformer).__name__
+            self.logger.debug(
+                f"Applying Lua transformer {idx + 1}/{len(transformers)}: {name}"
+            )
+
+            result = transformer.transform(current_ast)
+
+            if not result.success:
+                error_msg = (
+                    f"Lua transformer {name} failed: "
+                    f"{', '.join(result.errors)}"
+                )
+                self.logger.error(error_msg)
+                all_errors.extend(result.errors)
+                return GenerateResult(
+                    code="",
+                    success=False,
+                    errors=all_errors,
+                )
+
+            current_ast = result.ast_node
+            total_count += result.transformation_count
+            self.logger.debug(
+                f"{name} completed: {result.transformation_count} nodes transformed"
+            )
+
+        # Validate by attempting code generation
+        gen_result = self.generate_code(current_ast)
+        if not gen_result.success:
+            self.logger.warning(
+                f"Lua AST validation failed after {total_count} transformations"
+            )
+        else:
+            self.logger.info(
+                f"Lua transformation pipeline completed: "
+                f"{total_count} total transformations"
+            )
+
+        return gen_result
+
 
 class LuaNameManglingVisitor(luaparser.ast.ASTVisitor):
     """AST visitor that renames symbols using a pre-computed GlobalSymbolTable.
@@ -670,6 +791,27 @@ class LuaNameManglingVisitor(luaparser.ast.ASTVisitor):
         >>> visitor = LuaNameManglingVisitor(global_table, Path("script.lua"))
         >>> visitor.visit(ast_node)
         >>> # AST is now modified in-place with mangled names
+
+    Limitations and Edge Cases:
+        1. Dynamic requires: Cannot track require() with computed strings
+        2. String-based access: Cannot mangle table["key"] with string literals
+        3. Loadstring: Code in loadstring() is not analyzed
+        4. Metatables: Cannot track symbols accessed via __index metamethods
+        5. C modules: Cannot mangle symbols from C-based Lua modules
+        6. Roblox RemoteEvents: Event names passed as strings are not mangled
+        
+    Cross-File Consistency:
+        - Requires GlobalSymbolTable to be frozen before transformation
+        - Files must be processed in topological order from DependencyGraph
+        - Circular requires fall back to original file order (may affect consistency)
+        
+    Preserved Symbols:
+        - Lua keywords (local, function, end, if, then, etc.)
+        - Roblox global objects (game, workspace, script, plugin, etc.)
+        - Roblox services (Players, ReplicatedStorage, RunService, etc.)
+        - Roblox API methods (GetService, FindFirstChild, WaitForChild, etc.)
+        - Roblox datatypes (Vector3, CFrame, Color3, Instance, etc.)
+        - Symbols marked with is_exported=True (if preserve_exports config enabled)
     """
 
     def __init__(self, global_table: "GlobalSymbolTable", file_path: Path) -> None:
@@ -719,6 +861,24 @@ class LuaNameManglingVisitor(luaparser.ast.ASTVisitor):
 
         # Return original name if not found in symbol table
         return name
+
+    def _find_cross_file_mangled_name(self, name: str) -> str | None:
+        """Search all files in the global table for a mangled name.
+
+        Looks up a symbol by original_name in global scope across all files.
+        Used for resolving field/member accesses on required modules.
+
+        Args:
+            name: Original symbol name to look up
+
+        Returns:
+            Mangled name if found (and different from original), None otherwise
+        """
+        for entry in self.global_table.get_all_symbols():
+            if entry.original_name == name and entry.scope == "global":
+                if entry.mangled_name != name:
+                    return entry.mangled_name
+        return None
 
     def visit_Name(self, node: luaparser.astnodes.Name) -> None:
         """Transform Name nodes by replacing with mangled names.
@@ -791,6 +951,52 @@ class LuaNameManglingVisitor(luaparser.ast.ASTVisitor):
                         target.id = mangled
 
         # Continue traversal
+        self._visit_children(node)
+
+    def visit_Index(self, node: luaparser.astnodes.Index) -> None:
+        """Transform Index nodes by mangling field names for dot/bracket access.
+
+        For ``helper.calculate_sum``, if ``calculate_sum`` is a global symbol
+        in the GlobalSymbolTable, rewrites the field identifier to the mangled
+        name. Require paths and built-in names are left intact.
+
+        Args:
+            node: Index AST node
+        """
+        # Handle field name mangling for dot access (idx is a Name node)
+        if hasattr(node, 'idx') and node.idx:
+            if hasattr(node.idx, 'id') and node.idx.id:
+                field_name = node.idx.id
+                mangled = self._find_cross_file_mangled_name(field_name)
+                if mangled and mangled != field_name:
+                    self._logger.debug(f"Mangling Index field: {field_name} -> {mangled}")
+                    node.idx.id = mangled
+
+        # Only traverse the value child (skip idx to prevent double-mangling)
+        if hasattr(node, 'value') and node.value:
+            if hasattr(node.value, '__class__') and hasattr(node.value.__class__, '__module__'):
+                if 'astnodes' in node.value.__class__.__module__:
+                    self.visit(node.value)
+
+    def visit_Invoke(self, node: luaparser.astnodes.Invoke) -> None:
+        """Transform Invoke nodes by mangling method names for colon calls.
+
+        For ``obj:method()``, if ``method`` is a global symbol in the
+        GlobalSymbolTable, rewrites the method identifier to the mangled name.
+
+        Args:
+            node: Invoke AST node
+        """
+        # Handle method name mangling for colon calls: obj:method()
+        if hasattr(node, 'func') and node.func:
+            if hasattr(node.func, 'id') and node.func.id:
+                method_name = node.func.id
+                mangled = self._find_cross_file_mangled_name(method_name)
+                if mangled and mangled != method_name:
+                    self._logger.debug(f"Mangling Invoke method: {method_name} -> {mangled}")
+                    node.func.id = mangled
+
+        # Traverse source and args
         self._visit_children(node)
 
     def visit_LocalAssign(self, node: luaparser.astnodes.LocalAssign) -> None:

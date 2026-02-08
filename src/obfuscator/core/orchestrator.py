@@ -39,6 +39,7 @@ from obfuscator.processors.python_processor import PythonProcessor
 from obfuscator.processors.lua_processor import LuaProcessor
 from obfuscator.processors.symbol_extractor import SymbolTable
 from obfuscator.processors.lua_symbol_extractor import LuaSymbolTable
+from obfuscator.core.config import ObfuscationConfig
 from obfuscator.utils.logger import get_logger
 
 logger = get_logger("obfuscator.core.orchestrator")
@@ -106,12 +107,55 @@ class ObfuscationOrchestrator:
         ... )
     """
 
-    def __init__(self) -> None:
-        """Initialize the orchestrator with processors."""
-        self.python_processor = PythonProcessor()
-        self.lua_processor = LuaProcessor()
+    def __init__(self, config: ObfuscationConfig | None = None) -> None:
+        """Initialize the orchestrator with processors.
+
+        Args:
+            config: Optional ObfuscationConfig instance. If provided,
+                    the orchestrate() convenience method can be used.
+        """
+        self.python_processor = PythonProcessor(config=config)
+        self.lua_processor = LuaProcessor(config=config)
         self._logger = logger
         self._project_root: Path | None = None
+        self._config = config
+
+    def orchestrate(
+        self,
+        input_files: list[str | Path],
+        output_dir: str | Path,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+        project_root: str | Path | None = None
+    ) -> OrchestrationResult:
+        """Orchestrate obfuscation using the stored ObfuscationConfig.
+
+        This is a convenience alias for process_files() that uses the config
+        provided at construction time and accepts string paths.
+
+        Args:
+            input_files: List of input file paths (str or Path)
+            output_dir: Output directory (str or Path)
+            progress_callback: Optional progress callback
+            project_root: Optional project root directory
+
+        Returns:
+            OrchestrationResult with processing details
+        """
+        paths = [Path(f) for f in input_files]
+        out_path = Path(output_dir)
+        proj_root = Path(project_root) if project_root else None
+
+        config_dict: dict[str, Any] = {}
+        if self._config:
+            config_dict.update(self._config.symbol_table_options)
+
+        return self.process_files(
+            input_files=paths,
+            output_dir=out_path,
+            config=config_dict,
+            progress_callback=progress_callback,
+            project_root=proj_root
+        )
 
     def process_files(
         self,
