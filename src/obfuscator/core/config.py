@@ -66,6 +66,7 @@ VALID_FEATURES = {
     "roblox_remote_spy",
     "anti_tamper",
     "virtualization",
+    "self_modifying_code",
 }
 
 # Valid preset names
@@ -126,6 +127,10 @@ class ObfuscationConfig:
         "vm_protection_marker": "vm_protect",
         "opaque_predicate_complexity": 2,
         "opaque_predicate_percentage": 30,
+        "anti_debug_aggressiveness": 2,
+        "code_split_chunk_size": 5,
+        "code_split_encryption": True,
+        "self_modify_complexity": 2,
     })
     symbol_table_options: Dict[str, Any] = field(default_factory=lambda: {
         "identifier_prefix": "_0x",
@@ -286,6 +291,48 @@ class ObfuscationConfig:
                     "Option 'opaque_predicate_percentage' must be between 0 and 100"
                 )
 
+        # Anti-debugging options validation
+        if "anti_debug_aggressiveness" in self.options:
+            aggressiveness = self.options["anti_debug_aggressiveness"]
+            if not isinstance(aggressiveness, int):
+                raise ValueError(
+                    "Option 'anti_debug_aggressiveness' must be an integer"
+                )
+            if not 1 <= aggressiveness <= 3:
+                raise ValueError(
+                    "Option 'anti_debug_aggressiveness' must be between 1 and 3"
+                )
+
+        # Code splitting options validation
+        if "code_split_chunk_size" in self.options:
+            chunk_size = self.options["code_split_chunk_size"]
+            if not isinstance(chunk_size, int):
+                raise ValueError(
+                    "Option 'code_split_chunk_size' must be an integer"
+                )
+            if chunk_size < 2:
+                raise ValueError(
+                    "Option 'code_split_chunk_size' must be >= 2"
+                )
+
+        if "code_split_encryption" in self.options:
+            if not isinstance(self.options["code_split_encryption"], bool):
+                raise ValueError(
+                    "Option 'code_split_encryption' must be a boolean"
+                )
+
+        # Self-modifying code options validation
+        if "self_modify_complexity" in self.options:
+            sm_complexity = self.options["self_modify_complexity"]
+            if not isinstance(sm_complexity, int):
+                raise ValueError(
+                    "Option 'self_modify_complexity' must be an integer"
+                )
+            if not 1 <= sm_complexity <= 3:
+                raise ValueError(
+                    "Option 'self_modify_complexity' must be between 1 and 3"
+                )
+
         # Check symbol_table_options
         valid_strategies = {"sequential", "random", "minimal"}
         if "mangling_strategy" in self.symbol_table_options:
@@ -384,6 +431,9 @@ class ObfuscationConfig:
                     "vm_protection_marker": "vm:protect",
                     "opaque_predicate_complexity": 2,
                     "opaque_predicate_percentage": 30,
+                    "anti_debug_aggressiveness": 2,
+                    "code_split_chunk_size": 5,
+                    "code_split_encryption": True,
                 }),
                 symbol_table_options=data.get("symbol_table_options", {
                     "identifier_prefix": "_0x",
@@ -455,6 +505,9 @@ class ObfuscationConfig:
                 "vm_protection_marker": "vm:protect",
                 "opaque_predicate_complexity": 2,
                 "opaque_predicate_percentage": 30,
+                "anti_debug_aggressiveness": 2,
+                "code_split_chunk_size": 5,
+                "code_split_encryption": True,
             },
             symbol_table_options={
                 "identifier_prefix": "_0x",

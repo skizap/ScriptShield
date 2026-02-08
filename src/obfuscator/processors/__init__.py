@@ -55,7 +55,7 @@ Example:
 from obfuscator.processors.ast_transformer import (
     ASTTransformer,
     ConstantFoldingTransformer,
-    MangleIndexesTransformer,
+    SelfModifyingCodeTransformer,
     TransformResult,
 )
 from obfuscator.processors.feature_detector import (
@@ -99,7 +99,7 @@ __all__ = [
     "ASTTransformer",
     "TransformResult",
     "ConstantFoldingTransformer",
-    "MangleIndexesTransformer",
+    "SelfModifyingCodeTransformer",
     "TransformationPipelineResult",
     "UnsupportedFeatureDetector",
     "LuaProcessor",

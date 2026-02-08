@@ -13,6 +13,7 @@ import base64
 import math
 import random
 import secrets
+import textwrap
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
 
@@ -5348,3 +5349,1788 @@ class OpaquePredicatesTransformer(ASTTransformer):
                 errors=self.errors,
             )
 
+
+class AntiDebuggingTransformer(ASTTransformer):
+    """AST transformer that injects anti-debugging checks into code.
+
+    This transformer adds anti-debugging detection code to Python and Lua scripts
+    to detect and respond to debugging attempts. It uses multiple detection
+    techniques including:
+
+    - sys.gettrace() detection (debugger attached)
+    - Timing-based detection (execution stepping)
+    - Debugger module detection (pdb, pydevd, debugpy, etc.)
+    - Process inspection (parent process name)
+    - Debug library detection (Lua)
+    - Hook detection via debug.gethook() (Lua)
+
+    Injection points depend on the aggressiveness level:
+    - Level 1 (Minimal): Runtime functions only, manual check calls required
+    - Level 2 (Moderate): Runtime + automatic checks at function entries
+    - Level 3 (Aggressive): Runtime + function entries + critical points (loops, conditionals)
+
+    Args:
+        config: Optional obfuscation configuration
+        anti_debug_aggressiveness: Level of anti-debug checks (1-3), overrides config
+
+    Example:
+        >>> transformer = AntiDebuggingTransformer(anti_debug_aggressiveness=2)
+        >>> result = transformer.transform(ast_node)
+        >>> if result.success:
+        ...     print(f"Injected {result.transformation_count} anti-debug checks")
+
+    Note:
+        Platform-specific features (like process inspection) are wrapped in
+        try-except blocks to ensure cross-platform compatibility.
+    """
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        anti_debug_aggressiveness: Optional[int] = None
+    ):
+        """Initialize the anti-debugging transformer.
+
+        Args:
+            config: Optional obfuscation configuration
+            anti_debug_aggressiveness: Override aggressiveness level (1-3)
+        """
+        super().__init__()
+        self.config = config
+        self.language_mode = None
+        self.injection_count = 0
+        self.logger = get_logger("obfuscator.processors.anti_debugging")
+
+        # Extract aggressiveness from config or use parameter/default
+        if anti_debug_aggressiveness is not None:
+            self.anti_debug_aggressiveness = anti_debug_aggressiveness
+        elif config is not None and hasattr(config, 'options'):
+            self.anti_debug_aggressiveness = config.options.get('anti_debug_aggressiveness', 2)
+        else:
+            self.anti_debug_aggressiveness = 2
+
+        # Validate and clamp to valid range
+        if not isinstance(self.anti_debug_aggressiveness, int):
+            self.anti_debug_aggressiveness = 2
+        self.anti_debug_aggressiveness = max(1, min(3, self.anti_debug_aggressiveness))
+
+        # Runtime code generators
+        self._python_runtime_injected = False
+        self._lua_runtime_injected = False
+
+    def _should_inject_at_function_entry(self) -> bool:
+        """Determine if anti-debug checks should be added at function entry points.
+
+        Returns:
+            True if checks should be injected at function entries
+        """
+        return self.anti_debug_aggressiveness >= 2
+
+    def _should_inject_at_critical_points(self) -> bool:
+        """Determine if checks should be added at critical points like loops.
+
+        Returns:
+            True if checks should be injected at critical points
+        """
+        return self.anti_debug_aggressiveness >= 3
+
+    def _generate_python_check_variable_name(self) -> str:
+        """Generate unique variable name for anti-debug checks.
+
+        Returns:
+            Unique variable name like "_check_0", "_check_1"
+        """
+        name = f"_check_{self.injection_count}"
+        self.injection_count += 1
+        return name
+
+    def _inject_python_anti_debug_runtime(self) -> list[ast.stmt]:
+        """Generate and parse Python anti-debug runtime code.
+
+        Returns:
+            List of AST statement nodes for the runtime code
+        """
+        try:
+            from obfuscator.processors.anti_debug_runtime_python import (
+                generate_python_anti_debug_checks
+            )
+
+            runtime_code = generate_python_anti_debug_checks(
+                aggressiveness=self.anti_debug_aggressiveness
+            )
+            parsed = ast.parse(runtime_code)
+            return list(parsed.body)
+        except Exception as e:
+            self.logger.warning(f"Failed to generate Python anti-debug runtime: {e}")
+            return []
+
+    def _create_python_anti_debug_call(self) -> ast.Expr:
+        """Create AST node for calling anti-debug check function.
+
+        Returns:
+            AST expression node for the check call
+        """
+        call_node = ast.Expr(
+            value=ast.Call(
+                func=ast.Name(id='_check_env_0x1a2b', ctx=ast.Load()),
+                args=[],
+                keywords=[]
+            )
+        )
+        ast.fix_missing_locations(call_node)
+        return call_node
+
+    def _inject_lua_anti_debug_runtime(self) -> list[Any]:
+        """Generate and parse Lua anti-debug runtime code.
+
+        Returns:
+            List of Lua AST nodes for the runtime code
+        """
+        if not LUAPARSER_AVAILABLE:
+            return []
+
+        try:
+            from obfuscator.processors.anti_debug_runtime_lua import (
+                generate_lua_anti_debug_checks
+            )
+
+            runtime_code = generate_lua_anti_debug_checks(
+                aggressiveness=self.anti_debug_aggressiveness
+            )
+            parsed = lua_ast.parse(runtime_code)
+            return list(parsed.body.body) if hasattr(parsed.body, 'body') else []
+        except Exception as e:
+            self.logger.warning(f"Failed to generate Lua anti-debug runtime: {e}")
+            return []
+
+    def _create_lua_anti_debug_call(self) -> Any:
+        """Create Lua AST node for calling anti-debug check function.
+
+        Returns:
+            Lua AST call statement
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        try:
+            call_node = lua_nodes.Call(
+                func=lua_nodes.Name(id='_check_env_0x1a2b'),
+                args=lua_nodes.Expressions()
+            )
+            return lua_nodes.CallStatement(call_node)
+        except Exception as e:
+            self.logger.warning(f"Failed to create Lua anti-debug call: {e}")
+            return None
+
+    # Python Visitor Methods
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        """Inject anti-debug runtime at module level.
+
+        Injects runtime statements after any initial module docstring and
+        __future__ imports to preserve module semantics.
+
+        Args:
+            node: Python module AST node
+
+        Returns:
+            Modified module with anti-debug runtime injected
+        """
+        # Inject runtime functions at module level
+        if not self._python_runtime_injected:
+            runtime_statements = self._inject_python_anti_debug_runtime()
+            if runtime_statements:
+                # Find the correct insertion point (after docstring and __future__ imports)
+                insert_index = 0
+                for i, stmt in enumerate(node.body):
+                    # Check for docstring (must be first statement and a string literal)
+                    if i == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Str, ast.Constant)):
+                        insert_index = i + 1
+                    # Check for __future__ imports
+                    elif isinstance(stmt, ast.ImportFrom) and stmt.module == '__future__':
+                        insert_index = i + 1
+                    else:
+                        # Stop at first non-docstring, non-__future__ statement
+                        break
+
+                # Insert runtime statements at the computed index
+                node.body[insert_index:insert_index] = runtime_statements
+                self._python_runtime_injected = True
+                self.logger.debug(f"Injected {len(runtime_statements)} runtime statements at module level (index {insert_index})")
+
+                # Fix locations for all inserted nodes
+                for stmt in runtime_statements:
+                    ast.fix_missing_locations(stmt)
+
+        # Continue visiting child nodes
+        return self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Inject anti-debug checks at function entry points.
+
+        Args:
+            node: Python function definition AST node
+
+        Returns:
+            Modified function with anti-debug check at entry
+        """
+        # First process nested functions
+        node = self.generic_visit(node)
+
+        # Inject check at function entry if appropriate
+        if self._should_inject_at_function_entry():
+            check_call = self._create_python_anti_debug_call()
+            node.body.insert(0, check_call)
+            self.injection_count += 1
+            self.transformation_count += 1
+            self.logger.debug(f"Injected anti-debug check at function entry: {node.name}")
+
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+        """Inject anti-debug checks at async function entry points.
+
+        Args:
+            node: Python async function definition AST node
+
+        Returns:
+            Modified async function with anti-debug check at entry
+        """
+        # First process nested functions
+        node = self.generic_visit(node)
+
+        # Inject check at function entry if appropriate
+        if self._should_inject_at_function_entry():
+            check_call = self._create_python_anti_debug_call()
+            node.body.insert(0, check_call)
+            self.injection_count += 1
+            self.transformation_count += 1
+            self.logger.debug(f"Injected anti-debug check at async function entry: {node.name}")
+
+        return node
+
+    def visit_While(self, node: ast.While) -> ast.While:
+        """Inject anti-debug checks at loop entry for high aggressiveness.
+
+        Args:
+            node: Python while loop AST node
+
+        Returns:
+            Modified while loop with anti-debug check
+        """
+        # First process nested structures
+        node = self.generic_visit(node)
+
+        # Inject check at loop entry for aggressive mode
+        if self._should_inject_at_critical_points():
+            check_call = self._create_python_anti_debug_call()
+            node.body.insert(0, check_call)
+            self.injection_count += 1
+            self.transformation_count += 1
+            self.logger.debug("Injected anti-debug check at while loop entry")
+
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        """Inject anti-debug checks at for loop entry for high aggressiveness.
+
+        Args:
+            node: Python for loop AST node
+
+        Returns:
+            Modified for loop with anti-debug check
+        """
+        # First process nested structures
+        node = self.generic_visit(node)
+
+        # Inject check at loop entry for aggressive mode
+        if self._should_inject_at_critical_points():
+            check_call = self._create_python_anti_debug_call()
+            node.body.insert(0, check_call)
+            self.injection_count += 1
+            self.transformation_count += 1
+            self.logger.debug("Injected anti-debug check at for loop entry")
+
+        return node
+
+    # Lua Visitor Methods
+
+    def _traverse_lua_ast_for_anti_debug(self, node: Any, parent: Any = None) -> None:
+        """Traverse Lua AST and inject anti-debug checks.
+
+        Args:
+            node: Lua AST node to traverse
+            parent: Parent node for context
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        # Handle Chunk (module level)
+        if isinstance(node, lua_nodes.Chunk):
+            self.language_mode = "lua"
+
+            # Inject runtime at chunk level
+            if not self._lua_runtime_injected:
+                runtime_statements = self._inject_lua_anti_debug_runtime()
+                if runtime_statements:
+                    if hasattr(node.body, 'body'):
+                        node.body.body = runtime_statements + list(node.body.body)
+                    self._lua_runtime_injected = True
+                    self.logger.debug(f"Injected {len(runtime_statements)} Lua runtime statements at chunk level")
+
+        # Handle Function nodes
+        if isinstance(node, lua_nodes.Function):
+            if self._should_inject_at_function_entry():
+                check_call = self._create_lua_anti_debug_call()
+                if check_call and hasattr(node, 'body') and hasattr(node.body, 'body'):
+                    node.body.body.insert(0, check_call)
+                    self.injection_count += 1
+                    self.transformation_count += 1
+                    self.logger.debug("Injected anti-debug check at Lua function entry")
+
+        # Recursively traverse children
+        if hasattr(node, 'body') and isinstance(node.body, lua_nodes.Block):
+            for i, child in enumerate(node.body.body):
+                self._traverse_lua_ast_for_anti_debug(child, node)
+
+    def transform(self, ast_node: Union[ast.AST, Any]) -> TransformResult:
+        """Transform AST by injecting anti-debugging checks.
+
+        Args:
+            ast_node: Python or Lua AST node to transform
+
+        Returns:
+            TransformResult with the transformed AST and status information
+        """
+        try:
+            self.logger.info(
+                f"Starting anti-debugging injection (aggressiveness={self.anti_debug_aggressiveness})"
+            )
+
+            # Detect language and apply transformations
+            if isinstance(ast_node, ast.Module):
+                self.language_mode = 'python'
+                self.logger.debug("Detected Python language mode for anti-debugging")
+
+                # Fix missing locations before transformation
+                ast.fix_missing_locations(ast_node)
+
+                # Apply Python transformations by visiting the AST
+                transformed_node = self.visit(ast_node)
+
+                if transformed_node is None:
+                    raise ValueError("Transformation returned None")
+
+                # Fix missing locations on newly created nodes
+                ast.fix_missing_locations(transformed_node)
+
+            elif LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk):
+                self.language_mode = 'lua'
+                self.logger.debug("Detected Lua language mode for anti-debugging")
+
+                # Apply Lua transformations using custom traversal
+                self._traverse_lua_ast_for_anti_debug(ast_node)
+
+                # Lua transformation is in-place
+                transformed_node = ast_node
+
+            else:
+                # Unsupported node type, return failure
+                error_msg = f"Unsupported AST node type: {type(ast_node).__name__ if ast_node is not None else 'None'}"
+                self.logger.error(error_msg)
+                return TransformResult(
+                    ast_node=None,
+                    success=False,
+                    transformation_count=0,
+                    errors=[error_msg],
+                )
+
+            self.logger.info(
+                f"Anti-debugging injection completed: "
+                f"{self.transformation_count} checks injected"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = f"Anti-debugging injection failed: {e.__class__.__name__}: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+
+class CodeSplittingTransformer(ASTTransformer):
+    """Splits function bodies into encrypted chunks that are decrypted and executed at runtime.
+
+    This transformer enhances code obfuscation by breaking function bodies into
+    sequential encrypted chunks. At runtime, the chunks are decrypted, reassembled,
+    and executed using ``compile()``/``exec()`` (Python) or ``loadstring()``/``load()``
+    (Lua).
+
+    Encryption uses AES-GCM for Python chunks and XOR cipher for Lua chunks,
+    matching the patterns established by ``StringEncryptionTransformer``.
+
+    Attributes:
+        config: ObfuscationConfig with code_split options.
+        chunk_size: Number of statements per chunk (default: 5).
+        encryption_enabled: Whether to encrypt chunks (default: True).
+        encryption_key: Generated 16-byte AES key for chunk encryption.
+        language_mode: Detected language ('python', 'lua', or None).
+        runtime_injected: Whether decryption runtime has been injected.
+        split_functions: Set of function names that have been split.
+
+    Example:
+        >>> from obfuscator.core.config import ObfuscationConfig
+        >>> config = ObfuscationConfig(
+        ...     name="test",
+        ...     features={"code_splitting": True},
+        ...     options={"code_split_chunk_size": 5, "code_split_encryption": True},
+        ... )
+        >>> transformer = CodeSplittingTransformer(config=config)
+        >>> tree = ast.parse('''
+        ... def example(x):
+        ...     a = x + 1
+        ...     b = a * 2
+        ...     c = b - 3
+        ...     d = c / 4
+        ...     e = d + 5
+        ...     f = e * 6
+        ...     g = f - 7
+        ...     h = g / 8
+        ...     i = h + 9
+        ...     j = i * 10
+        ...     return j
+        ... ''')
+        >>> result = transformer.transform(tree)
+        >>> if result.success:
+        ...     print(f"Split {result.transformation_count} functions")
+    """
+
+    # Minimum allowed chunk size
+    MIN_CHUNK_SIZE = 2
+    # Default statements per chunk
+    DEFAULT_CHUNK_SIZE = 5
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        chunk_size: Optional[int] = None,
+        encryption_enabled: Optional[bool] = None,
+    ) -> None:
+        """Initialize the code splitting transformer.
+
+        Args:
+            config: ObfuscationConfig instance with code splitting options.
+                   If provided, chunk_size and encryption_enabled are extracted
+                   from config.options.
+            chunk_size: Override for statements per chunk. Must be >= 2.
+                       If not provided, uses config or defaults to 5.
+            encryption_enabled: Override for enabling chunk encryption.
+                              If not provided, uses config or defaults to True.
+        """
+        super().__init__()
+        self.logger = get_logger("obfuscator.processors.code_splitting")
+        self.config = config
+
+        # Determine chunk_size from parameter or config
+        if chunk_size is not None:
+            self.chunk_size = chunk_size
+        elif config is not None and hasattr(config, 'options'):
+            self.chunk_size = config.options.get(
+                'code_split_chunk_size', self.DEFAULT_CHUNK_SIZE
+            )
+        else:
+            self.chunk_size = self.DEFAULT_CHUNK_SIZE
+
+        # Validate and clamp chunk_size
+        if not isinstance(self.chunk_size, int) or self.chunk_size < self.MIN_CHUNK_SIZE:
+            self.logger.warning(
+                f"chunk_size={self.chunk_size} is invalid, using minimum {self.MIN_CHUNK_SIZE}"
+            )
+            self.chunk_size = self.MIN_CHUNK_SIZE
+
+        # Determine encryption_enabled from parameter or config
+        if encryption_enabled is not None:
+            self.encryption_enabled = encryption_enabled
+        elif config is not None and hasattr(config, 'options'):
+            self.encryption_enabled = config.options.get(
+                'code_split_encryption', True
+            )
+        else:
+            self.encryption_enabled = True
+
+        # Generate encryption key (IV is generated per-chunk for AES-GCM)
+        self.encryption_key: bytes = secrets.token_bytes(16)
+
+        # Language detection and state tracking
+        self.language_mode: Optional[str] = None
+        self.runtime_injected: bool = False
+
+        # Track transformed functions
+        self.split_functions: set = set()
+
+        self.logger.debug(
+            f"CodeSplittingTransformer initialized with "
+            f"chunk_size={self.chunk_size}, encryption_enabled={self.encryption_enabled}"
+        )
+
+    # ── Encryption Methods ──────────────────────────────────────────────
+
+    def _encrypt_chunk_aes(self, code: str) -> bytes:
+        """Encrypt a code chunk using AES-GCM with a fresh per-chunk IV.
+
+        Generates a random 12-byte IV for each chunk and prefixes it to the
+        ciphertext so the runtime can extract it before decryption.
+
+        Args:
+            code: The source code string to encrypt.
+
+        Returns:
+            Bytes of ``iv (12 bytes) + ciphertext + auth-tag``.
+
+        Raises:
+            RuntimeError: If the cryptography library is not available.
+        """
+        if not CRYPTOGRAPHY_AVAILABLE:
+            raise RuntimeError(
+                "cryptography library is required for AES encryption. "
+                "Install it with: pip install cryptography"
+            )
+
+        chunk_iv = secrets.token_bytes(12)
+        aesgcm = AESGCM(self.encryption_key)
+        plaintext_bytes = code.encode('utf-8')
+        ciphertext = aesgcm.encrypt(chunk_iv, plaintext_bytes, None)
+        return chunk_iv + ciphertext
+
+    def _encrypt_chunk_xor(self, code: str) -> bytes:
+        """Encrypt a code chunk using XOR cipher (for Lua compatibility).
+
+        Args:
+            code: The source code string to encrypt.
+
+        Returns:
+            XOR-encrypted bytes.
+        """
+        plaintext_bytes = code.encode('utf-8')
+        key_bytes = self.encryption_key
+        key_len = len(key_bytes)
+
+        encrypted = bytes(
+            plaintext_bytes[i] ^ key_bytes[i % key_len]
+            for i in range(len(plaintext_bytes))
+        )
+        return encrypted
+
+    # ── Python Transformation Methods ───────────────────────────────────
+
+    def _split_python_function(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Split a Python function body into encrypted chunks.
+
+        Extracts the function body statements, splits them into groups of
+        ``chunk_size``, encrypts each group, and replaces the body with a
+        wrapper that calls ``_reassemble_function()`` at runtime.
+
+        Args:
+            node: The FunctionDef AST node to split.
+
+        Returns:
+            Modified FunctionDef with its body replaced by a chunk-loading wrapper.
+        """
+        body_stmts = node.body
+
+        # Split body into chunks
+        chunks = []
+        for i in range(0, len(body_stmts), self.chunk_size):
+            chunk_stmts = body_stmts[i:i + self.chunk_size]
+            chunks.append(chunk_stmts)
+
+        # Convert each chunk to source code and encrypt
+        encrypted_chunks_b64 = []
+        for chunk_stmts in chunks:
+            try:
+                chunk_code = '\n'.join(ast.unparse(stmt) for stmt in chunk_stmts)
+            except AttributeError:
+                # Fallback for Python < 3.9
+                try:
+                    import astor
+                    chunk_code = '\n'.join(
+                        astor.to_source(stmt).strip() for stmt in chunk_stmts
+                    )
+                except ImportError:
+                    error_msg = (
+                        "ast.unparse() not available and astor not installed. "
+                        "Python 3.9+ or astor is required for code splitting."
+                    )
+                    self.errors.append(error_msg)
+                    self.logger.error(error_msg)
+                    return node
+
+            try:
+                if self.encryption_enabled:
+                    encrypted_bytes = self._encrypt_chunk_aes(chunk_code)
+                    encrypted_b64 = base64.b64encode(encrypted_bytes).decode('ascii')
+                else:
+                    encrypted_b64 = base64.b64encode(
+                        chunk_code.encode('utf-8')
+                    ).decode('ascii')
+                encrypted_chunks_b64.append(encrypted_b64)
+            except Exception as e:
+                error_msg = f"Failed to encrypt chunk for function '{node.name}': {e}"
+                self.errors.append(error_msg)
+                self.logger.warning(error_msg)
+                return node
+
+        # Extract parameter names from the function signature
+        arg_names = []
+        for arg in node.args.args:
+            arg_names.append(arg.arg)
+        for arg in node.args.posonlyargs:
+            arg_names.append(arg.arg)
+        for arg in node.args.kwonlyargs:
+            arg_names.append(arg.arg)
+        if node.args.vararg:
+            arg_names.append(node.args.vararg.arg)
+        if node.args.kwarg:
+            arg_names.append(node.args.kwarg.arg)
+
+        # Build the list of encrypted chunk strings as AST
+        chunk_list = ast.List(
+            elts=[ast.Constant(value=c) for c in encrypted_chunks_b64],
+            ctx=ast.Load(),
+        )
+
+        # Build list of parameter name strings
+        arg_names_list = ast.List(
+            elts=[ast.Constant(value=n) for n in arg_names],
+            ctx=ast.Load(),
+        )
+
+        # Build list of parameter value references
+        arg_values_list = ast.List(
+            elts=[ast.Name(id=n, ctx=ast.Load()) for n in arg_names],
+            ctx=ast.Load(),
+        )
+
+        # Build: return _reassemble_function(
+        #     chunks, globals(), locals(), arg_names, arg_values)
+        reassemble_call = ast.Call(
+            func=ast.Name(id='_reassemble_function', ctx=ast.Load()),
+            args=[
+                chunk_list,
+                ast.Call(
+                    func=ast.Name(id='globals', ctx=ast.Load()),
+                    args=[], keywords=[],
+                ),
+                ast.Call(
+                    func=ast.Name(id='locals', ctx=ast.Load()),
+                    args=[], keywords=[],
+                ),
+                arg_names_list,
+                arg_values_list,
+            ],
+            keywords=[],
+        )
+
+        # Create wrapper body: directly return the result of _reassemble_function
+        return_result = ast.Return(value=reassemble_call)
+
+        # Replace function body with wrapper
+        new_body = [return_result]
+
+        # Copy location info
+        for new_node in new_body:
+            ast.copy_location(new_node, node)
+
+        node.body = new_body
+
+        self.split_functions.add(node.name)
+        self.transformation_count += 1
+        self.logger.debug(
+            f"Split function '{node.name}' into {len(encrypted_chunks_b64)} chunks"
+        )
+
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        """Visit FunctionDef nodes and split eligible functions.
+
+        A function is eligible for splitting if:
+        - Its body has at least ``chunk_size * 2`` statements
+        - It is not an async function
+        - It does not contain ``yield`` (not a generator)
+
+        Args:
+            node: The FunctionDef AST node.
+
+        Returns:
+            The transformed (or original) FunctionDef node.
+        """
+        # Visit nested functions first
+        self.generic_visit(node)
+
+        # Check eligibility: body must be large enough for meaningful splitting
+        if len(node.body) < self.chunk_size * 2:
+            return node
+
+        # Skip generators (functions with yield)
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                self.logger.debug(
+                    f"Skipping generator function '{node.name}'"
+                )
+                return node
+
+        # Split the function
+        try:
+            return self._split_python_function(node)
+        except Exception as e:
+            error_msg = f"Failed to split function '{node.name}': {e}"
+            self.errors.append(error_msg)
+            self.logger.warning(error_msg)
+            return node
+
+    def _inject_python_runtime(self, module: ast.Module) -> None:
+        """Inject Python chunk decryption runtime at the beginning of a module.
+
+        Imports runtime generators and inserts the generated decryption code
+        after any ``__future__`` imports and module docstrings.
+
+        Args:
+            module: The Python AST Module node to inject into.
+        """
+        if self.runtime_injected:
+            return
+
+        try:
+            from obfuscator.processors.code_split_runtime_python import (
+                generate_python_chunk_decryption_runtime,
+            )
+
+            runtime_code = generate_python_chunk_decryption_runtime(
+                self.encryption_key, self.encryption_enabled
+            )
+            runtime_tree = ast.parse(runtime_code)
+            runtime_nodes = runtime_tree.body
+        except Exception as e:
+            error_msg = f"Failed to generate Python code-split runtime: {e}"
+            self.errors.append(error_msg)
+            self.logger.error(error_msg)
+            return
+
+        # Find insertion point after __future__ imports and docstrings
+        insert_index = 0
+        for i, stmt in enumerate(module.body):
+            if isinstance(stmt, ast.ImportFrom) and stmt.module == '__future__':
+                insert_index = i + 1
+            elif (
+                i == 0
+                and isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                insert_index = 1
+            else:
+                break
+
+        # Insert runtime nodes at the calculated position
+        for j, rnode in enumerate(runtime_nodes):
+            ast.fix_missing_locations(rnode)
+            module.body.insert(insert_index + j, rnode)
+
+        self.runtime_injected = True
+        self.logger.debug("Injected Python chunk decryption runtime")
+
+    # ── Lua Transformation Methods ──────────────────────────────────────
+
+    def _split_lua_function(self, node: Any) -> Any:
+        """Split a Lua function body into encrypted chunks.
+
+        Extracts the function body statements, splits them into groups of
+        ``chunk_size``, encrypts each group with XOR, and replaces the body
+        with a wrapper that calls ``_reassemble_function()`` at runtime.
+
+        Args:
+            node: The Lua Function AST node to split.
+
+        Returns:
+            Modified Function node with its body replaced by a chunk-loading wrapper,
+            or the original node if splitting fails.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return node
+
+        try:
+            # Extract body statements
+            if hasattr(node.body, 'body'):
+                body_stmts = list(node.body.body)
+            else:
+                body_stmts = list(node.body) if node.body else []
+
+            if not body_stmts:
+                return node
+
+            # Split body into chunks
+            chunks = []
+            for i in range(0, len(body_stmts), self.chunk_size):
+                chunk_stmts = body_stmts[i:i + self.chunk_size]
+                chunks.append(chunk_stmts)
+
+            # Convert each chunk to Lua source code and encrypt
+            encrypted_chunk_strings = []
+            for chunk_stmts in chunks:
+                try:
+                    chunk_code = '\n'.join(
+                        lua_ast.to_lua_source(
+                            lua_nodes.Chunk(lua_nodes.Block([stmt]))
+                        ).strip()
+                        for stmt in chunk_stmts
+                    )
+                except Exception as e2:
+                    error_msg = f"Failed to serialize Lua chunk: {e2}"
+                    self.errors.append(error_msg)
+                    self.logger.warning(error_msg)
+                    return node
+
+                try:
+                    if self.encryption_enabled:
+                        encrypted_bytes = self._encrypt_chunk_xor(chunk_code)
+                    else:
+                        encrypted_bytes = chunk_code.encode('utf-8')
+
+                    # Escape encrypted bytes for Lua string literal
+                    escaped = ''.join(f'\\{b}' for b in encrypted_bytes)
+                    encrypted_chunk_strings.append(escaped)
+                except Exception as e:
+                    error_msg = f"Failed to encrypt Lua chunk: {e}"
+                    self.errors.append(error_msg)
+                    self.logger.warning(error_msg)
+                    return node
+
+            # Build Lua AST for the wrapper
+            # Create table of encrypted chunks
+            chunk_fields = []
+            for escaped_str in encrypted_chunk_strings:
+                raw = f'"{escaped_str}"'
+                str_node = lua_nodes.String(
+                    escaped_str.encode('latin-1', errors='replace'),
+                    raw,
+                    lua_nodes.StringDelimiter.DOUBLE_QUOTE,
+                )
+                chunk_fields.append(lua_nodes.Field(value=str_node))
+
+            chunks_table = lua_nodes.Table(fields=chunk_fields)
+
+            # Create call: _reassemble_function({chunks}, ...)
+            # The varargs (...) forwards the original function arguments
+            vararg_node = lua_nodes.Dots()
+            call_node = lua_nodes.Call(
+                func=lua_nodes.Name('_reassemble_function'),
+                args=[chunks_table, vararg_node],
+            )
+            call_stmt = lua_nodes.Return(values=[call_node])
+
+            # Replace function body
+            if hasattr(node.body, 'body'):
+                node.body.body = [call_stmt]
+            else:
+                node.body = [call_stmt]
+
+            # Extract function name for tracking
+            func_name = getattr(node, 'name', None)
+            if func_name and hasattr(func_name, 'id'):
+                self.split_functions.add(func_name.id)
+            elif isinstance(func_name, str):
+                self.split_functions.add(func_name)
+
+            self.transformation_count += 1
+            self.logger.debug(
+                f"Split Lua function into {len(encrypted_chunk_strings)} chunks"
+            )
+            return node
+
+        except Exception as e:
+            error_msg = f"Failed to split Lua function: {e}"
+            self.errors.append(error_msg)
+            self.logger.warning(error_msg)
+            return node
+
+    def _traverse_lua_ast_for_splitting(self, node: Any) -> None:
+        """Recursively traverse Lua AST and split eligible function nodes.
+
+        Identifies ``lua_nodes.Function`` nodes with bodies large enough
+        for meaningful splitting (at least ``chunk_size * 2`` statements).
+
+        Args:
+            node: The current Lua AST node to traverse.
+        """
+        if not LUAPARSER_AVAILABLE or node is None:
+            return
+
+        # Handle Function nodes
+        if isinstance(node, lua_nodes.Function):
+            # Check eligibility
+            body_stmts = []
+            if hasattr(node, 'body'):
+                if hasattr(node.body, 'body'):
+                    body_stmts = node.body.body
+                elif isinstance(node.body, list):
+                    body_stmts = node.body
+
+            if len(body_stmts) >= self.chunk_size * 2:
+                self._split_lua_function(node)
+
+        # Recursively traverse children
+        for attr_name in dir(node):
+            if attr_name.startswith('_'):
+                continue
+
+            attr = getattr(node, attr_name, None)
+            if attr is None:
+                continue
+
+            if isinstance(attr, list):
+                for item in attr:
+                    if (
+                        hasattr(item, '__class__')
+                        and hasattr(item.__class__, '__module__')
+                        and 'astnodes' in getattr(item.__class__, '__module__', '')
+                    ):
+                        self._traverse_lua_ast_for_splitting(item)
+            elif (
+                hasattr(attr, '__class__')
+                and hasattr(attr.__class__, '__module__')
+                and 'astnodes' in getattr(attr.__class__, '__module__', '')
+            ):
+                self._traverse_lua_ast_for_splitting(attr)
+
+    def _inject_lua_runtime(self, chunk: Any) -> None:
+        """Inject Lua chunk decryption runtime at the beginning of a chunk.
+
+        Args:
+            chunk: The Lua AST Chunk node to inject into.
+        """
+        if not LUAPARSER_AVAILABLE:
+            self.logger.warning(
+                "luaparser not available, skipping Lua runtime injection"
+            )
+            return
+
+        if self.runtime_injected:
+            return
+
+        try:
+            from obfuscator.processors.code_split_runtime_lua import (
+                generate_lua_chunk_decryption_runtime,
+            )
+
+            runtime_code = generate_lua_chunk_decryption_runtime(
+                self.encryption_key, self.encryption_enabled
+            )
+            runtime_tree = lua_ast.parse(runtime_code)
+
+            if hasattr(runtime_tree, 'body') and hasattr(chunk, 'body'):
+                if hasattr(chunk.body, 'body'):
+                    chunk.body.body = runtime_tree.body.body + chunk.body.body
+                else:
+                    chunk.body = runtime_tree.body.body + chunk.body
+
+            self.runtime_injected = True
+            self.logger.debug("Injected Lua chunk decryption runtime")
+
+        except Exception as e:
+            error_msg = f"Failed to inject Lua code-split runtime: {e}"
+            self.errors.append(error_msg)
+            self.logger.error(error_msg)
+
+    # ── Transform Orchestration ─────────────────────────────────────────
+
+    def transform(self, ast_node: Union[ast.AST, Any]) -> TransformResult:
+        """Apply code splitting transformation to an AST.
+
+        Orchestrates the full transformation pipeline:
+        1. Reset state for this run
+        2. Detect language from AST node type
+        3. Visit/traverse functions and split eligible ones
+        4. Inject decryption runtime at module/chunk start
+        5. Fix missing locations
+        6. Return structured result
+
+        Args:
+            ast_node: The AST node to transform (``ast.Module`` for Python
+                     or ``lua_nodes.Chunk`` for Lua).
+
+        Returns:
+            TransformResult with the transformed AST, success status,
+            transformation count, and any errors.
+        """
+        # Reset state
+        self.transformation_count = 0
+        self.errors = []
+        self.runtime_injected = False
+        self.split_functions.clear()
+
+        try:
+            self.logger.info(
+                f"Starting code splitting (chunk_size={self.chunk_size}, "
+                f"encryption={self.encryption_enabled})"
+            )
+
+            if isinstance(ast_node, ast.Module):
+                self.language_mode = 'python'
+                self.logger.debug("Detected Python language mode for code splitting")
+
+                # Fix missing locations before transformation
+                ast.fix_missing_locations(ast_node)
+
+                # Apply Python transformations by visiting the AST
+                transformed_node = self.visit(ast_node)
+
+                if transformed_node is None:
+                    raise ValueError("Transformation returned None")
+
+                # Inject runtime AFTER transformation to avoid splitting runtime code
+                if self.transformation_count > 0:
+                    self._inject_python_runtime(transformed_node)
+
+                # Fix missing locations on newly created nodes
+                ast.fix_missing_locations(transformed_node)
+
+            elif LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk):
+                self.language_mode = 'lua'
+                self.logger.debug("Detected Lua language mode for code splitting")
+
+                # Apply Lua transformations using custom traversal
+                self._traverse_lua_ast_for_splitting(ast_node)
+
+                # Inject runtime AFTER transformation
+                if self.transformation_count > 0:
+                    self._inject_lua_runtime(ast_node)
+
+                transformed_node = ast_node
+
+            else:
+                error_msg = (
+                    f"Unsupported AST node type: "
+                    f"{type(ast_node).__name__ if ast_node is not None else 'None'}"
+                )
+                self.logger.error(error_msg)
+                return TransformResult(
+                    ast_node=None,
+                    success=False,
+                    transformation_count=0,
+                    errors=[error_msg],
+                )
+
+            self.logger.info(
+                f"Code splitting completed: {self.transformation_count} functions split, "
+                f"functions: {self.split_functions}"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = f"Code splitting failed: {e.__class__.__name__}: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+
+class SelfModifyingCodeTransformer(ASTTransformer):
+    """AST transformer that generates self-modifying code.
+
+    This transformer converts eligible functions into self-modifying versions
+    that dynamically redefine themselves at runtime. For Python, it uses
+    ``exec()`` and ``compile()`` to redefine functions. For Lua, it uses
+    ``loadstring()``/``load()`` for runtime code generation.
+
+    Self-modifying code is a powerful obfuscation technique that makes static
+    analysis significantly harder because the actual function bodies are only
+    constructed at runtime.
+
+    Attributes:
+        config: Optional ObfuscationConfig with self_modify options.
+        complexity: Self-modification complexity level (1-3).
+        language_mode: Detected language ('python', 'lua', or None).
+        runtime_injected: Whether the self-modify runtime has been injected.
+        modified_functions: Set of function names that have been transformed.
+
+    Example:
+        >>> transformer = SelfModifyingCodeTransformer(complexity=2)
+        >>> tree = ast.parse('''
+        ... def example(x):
+        ...     a = x + 1
+        ...     b = a * 2
+        ...     c = b - 3
+        ...     return c
+        ... ''')
+        >>> result = transformer.transform(tree)
+        >>> if result.success:
+        ...     print(f"Modified {result.transformation_count} functions")
+    """
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        complexity: Optional[int] = None,
+    ) -> None:
+        """Initialize the self-modifying code transformer.
+
+        Args:
+            config: Optional ObfuscationConfig instance. If provided,
+                   ``self_modify_complexity`` is extracted from config.options.
+            complexity: Override for complexity level (1-3).
+                       If not provided, uses config or defaults to 2.
+        """
+        super().__init__()
+        self.logger = get_logger("obfuscator.processors.self_modifying_code")
+        self.config = config
+
+        # Extract complexity from parameter or config
+        if complexity is not None:
+            self.complexity = complexity
+        elif config is not None and hasattr(config, 'options'):
+            self.complexity = config.options.get('self_modify_complexity', 2)
+        else:
+            self.complexity = 2
+
+        # Validate and clamp complexity to 1-3 range
+        if not isinstance(self.complexity, int):
+            self.complexity = 2
+        self.complexity = max(1, min(3, self.complexity))
+
+        # Language detection and state tracking
+        self.language_mode: Optional[str] = None
+        self.runtime_injected: bool = False
+
+        # Track transformed functions
+        self.modified_functions: set = set()
+
+        self.logger.debug(
+            f"SelfModifyingCodeTransformer initialized with complexity={self.complexity}"
+        )
+
+    # ── Python Transformation Methods ───────────────────────────────────
+
+    def _make_function_self_modifying(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        """Transform a Python function to use self-modification.
+
+        Extracts the function body, converts it to a code string, and creates
+        a wrapper that calls ``_redefine_function()`` at runtime to dynamically
+        reconstruct and execute the original function body.
+
+        Args:
+            node: The FunctionDef AST node to transform.
+
+        Returns:
+            Modified FunctionDef with its body replaced by a self-modifying wrapper.
+        """
+        # Build full function source using ast.unparse to preserve
+        # defaults, decorators, annotations, and full signature
+        try:
+            full_func_code = textwrap.dedent(ast.unparse(node))
+        except AttributeError:
+            try:
+                import astor
+                full_func_code = textwrap.dedent(astor.to_source(node).strip())
+            except ImportError:
+                error_msg = (
+                    "ast.unparse() not available and astor not installed. "
+                    "Python 3.9+ or astor is required for self-modifying code."
+                )
+                self.errors.append(error_msg)
+                self.logger.error(error_msg)
+                return node
+
+        # Extract parameter info for forwarding the call
+        positional_args = []
+        for arg in node.args.args:
+            positional_args.append(arg.arg)
+        for arg in node.args.posonlyargs:
+            positional_args.append(arg.arg)
+        kwonly_args = [arg.arg for arg in node.args.kwonlyargs]
+        vararg_name = node.args.vararg.arg if node.args.vararg else None
+        kwarg_name = node.args.kwarg.arg if node.args.kwarg else None
+
+        # Build AST for the self-modifying wrapper body:
+        # Store code as string, redefine on first call
+
+        # Create: _sm_code = "<full_func_code>"
+        code_assign = ast.Assign(
+            targets=[ast.Name(id='_sm_code', ctx=ast.Store())],
+            value=ast.Constant(value=full_func_code),
+            lineno=node.lineno,
+        )
+
+        # Create: _sm_ns = dict(globals())
+        ns_assign = ast.Assign(
+            targets=[ast.Name(id='_sm_ns', ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id='dict', ctx=ast.Load()),
+                args=[
+                    ast.Call(
+                        func=ast.Name(id='globals', ctx=ast.Load()),
+                        args=[], keywords=[],
+                    ),
+                ],
+                keywords=[],
+            ),
+            lineno=node.lineno,
+        )
+
+        # Create: _sm_func = _redefine_function(func_name, _sm_code, _sm_ns)
+        redefine_call = ast.Assign(
+            targets=[ast.Name(id='_sm_func', ctx=ast.Store())],
+            value=ast.Call(
+                func=ast.Name(id='_redefine_function', ctx=ast.Load()),
+                args=[
+                    ast.Constant(value=node.name),
+                    ast.Name(id='_sm_code', ctx=ast.Load()),
+                    ast.Name(id='_sm_ns', ctx=ast.Load()),
+                ],
+                keywords=[],
+            ),
+            lineno=node.lineno,
+        )
+
+        # Create argument value references for proper forwarding
+        call_args = [ast.Name(id=n, ctx=ast.Load()) for n in positional_args]
+        if vararg_name:
+            call_args.append(ast.Starred(
+                value=ast.Name(id=vararg_name, ctx=ast.Load()),
+                ctx=ast.Load(),
+            ))
+        call_keywords = [
+            ast.keyword(arg=n, value=ast.Name(id=n, ctx=ast.Load()))
+            for n in kwonly_args
+        ]
+        if kwarg_name:
+            call_keywords.append(ast.keyword(
+                arg=None,
+                value=ast.Name(id=kwarg_name, ctx=ast.Load()),
+            ))
+
+        # Create: if _sm_func is not None: return _sm_func(...)
+        sm_call = ast.Call(
+            func=ast.Name(id='_sm_func', ctx=ast.Load()),
+            args=call_args,
+            keywords=call_keywords,
+        )
+
+        return_stmt = ast.If(
+            test=ast.Compare(
+                left=ast.Name(id='_sm_func', ctx=ast.Load()),
+                ops=[ast.IsNot()],
+                comparators=[ast.Constant(value=None)],
+            ),
+            body=[ast.Return(value=sm_call)],
+            orelse=[],
+        )
+
+        # Replace function body with self-modifying wrapper
+        new_body = [code_assign, ns_assign, redefine_call, return_stmt]
+
+        # Copy location info
+        for new_node in new_body:
+            ast.copy_location(new_node, node)
+
+        node.body = new_body
+
+        self.modified_functions.add(node.name)
+        self.transformation_count += 1
+        self.logger.debug(
+            f"Made function '{node.name}' self-modifying"
+        )
+
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        """Visit FunctionDef nodes and apply self-modification to eligible functions.
+
+        A function is eligible for self-modification if:
+        - Its body has at least 3 statements
+        - It does not contain ``yield`` or ``yield from`` (not a generator)
+
+        Args:
+            node: The FunctionDef AST node.
+
+        Returns:
+            The transformed (or original) FunctionDef node.
+        """
+        # Visit nested functions first
+        self.generic_visit(node)
+
+        # Check eligibility: body must have at least 3 statements
+        if len(node.body) < 3:
+            return node
+
+        # Skip generators (functions with yield)
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                self.logger.debug(
+                    f"Skipping generator function '{node.name}'"
+                )
+                return node
+
+        # Apply self-modification
+        try:
+            return self._make_function_self_modifying(node)
+        except Exception as e:
+            error_msg = f"Failed to make function '{node.name}' self-modifying: {e}"
+            self.errors.append(error_msg)
+            self.logger.warning(error_msg)
+            return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        """Visit AsyncFunctionDef nodes and apply self-modification.
+
+        Async functions with at least 3 statements and no yield expressions
+        are eligible for self-modification.
+
+        Args:
+            node: The AsyncFunctionDef AST node.
+
+        Returns:
+            The transformed (or original) AsyncFunctionDef node.
+        """
+        # Visit nested functions first
+        self.generic_visit(node)
+
+        # Check eligibility: body must have at least 3 statements
+        if len(node.body) < 3:
+            return node
+
+        # Skip async generators
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                self.logger.debug(
+                    f"Skipping async generator function '{node.name}'"
+                )
+                return node
+
+        # Extract body and convert to code for self-modification
+        try:
+            # Build full function source using ast.unparse to preserve
+            # defaults, decorators, annotations, and full signature
+            try:
+                full_func_code = textwrap.dedent(ast.unparse(node))
+            except AttributeError:
+                try:
+                    import astor
+                    full_func_code = textwrap.dedent(astor.to_source(node).strip())
+                except ImportError:
+                    return node
+
+            # Extract parameter info for forwarding the call
+            positional_args = []
+            for arg in node.args.args:
+                positional_args.append(arg.arg)
+            for arg in node.args.posonlyargs:
+                positional_args.append(arg.arg)
+            kwonly_args = [arg.arg for arg in node.args.kwonlyargs]
+            vararg_name = node.args.vararg.arg if node.args.vararg else None
+            kwarg_name = node.args.kwarg.arg if node.args.kwarg else None
+
+            # Build wrapper body
+            code_assign = ast.Assign(
+                targets=[ast.Name(id='_sm_code', ctx=ast.Store())],
+                value=ast.Constant(value=full_func_code),
+                lineno=node.lineno,
+            )
+
+            ns_assign = ast.Assign(
+                targets=[ast.Name(id='_sm_ns', ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Name(id='dict', ctx=ast.Load()),
+                    args=[
+                        ast.Call(
+                            func=ast.Name(id='globals', ctx=ast.Load()),
+                            args=[], keywords=[],
+                        ),
+                    ],
+                    keywords=[],
+                ),
+                lineno=node.lineno,
+            )
+
+            redefine_call = ast.Assign(
+                targets=[ast.Name(id='_sm_func', ctx=ast.Store())],
+                value=ast.Call(
+                    func=ast.Name(id='_redefine_function', ctx=ast.Load()),
+                    args=[
+                        ast.Constant(value=node.name),
+                        ast.Name(id='_sm_code', ctx=ast.Load()),
+                        ast.Name(id='_sm_ns', ctx=ast.Load()),
+                    ],
+                    keywords=[],
+                ),
+                lineno=node.lineno,
+            )
+
+            # Create argument value references for proper forwarding
+            call_args = [ast.Name(id=n, ctx=ast.Load()) for n in positional_args]
+            if vararg_name:
+                call_args.append(ast.Starred(
+                    value=ast.Name(id=vararg_name, ctx=ast.Load()),
+                    ctx=ast.Load(),
+                ))
+            call_keywords = [
+                ast.keyword(arg=n, value=ast.Name(id=n, ctx=ast.Load()))
+                for n in kwonly_args
+            ]
+            if kwarg_name:
+                call_keywords.append(ast.keyword(
+                    arg=None,
+                    value=ast.Name(id=kwarg_name, ctx=ast.Load()),
+                ))
+
+            # Create: if _sm_func is not None: return await _sm_func(...)
+            sm_call = ast.Call(
+                func=ast.Name(id='_sm_func', ctx=ast.Load()),
+                args=call_args,
+                keywords=call_keywords,
+            )
+
+            return_stmt = ast.If(
+                test=ast.Compare(
+                    left=ast.Name(id='_sm_func', ctx=ast.Load()),
+                    ops=[ast.IsNot()],
+                    comparators=[ast.Constant(value=None)],
+                ),
+                body=[ast.Return(value=ast.Await(value=sm_call))],
+                orelse=[],
+            )
+
+            new_body = [code_assign, ns_assign, redefine_call, return_stmt]
+            for new_node in new_body:
+                ast.copy_location(new_node, node)
+
+            node.body = new_body
+
+            self.modified_functions.add(node.name)
+            self.transformation_count += 1
+            self.logger.debug(
+                f"Made async function '{node.name}' self-modifying"
+            )
+
+        except Exception as e:
+            error_msg = f"Failed to make async function '{node.name}' self-modifying: {e}"
+            self.errors.append(error_msg)
+            self.logger.warning(error_msg)
+
+        return node
+
+    def _inject_python_runtime(self, module: ast.Module) -> None:
+        """Inject Python self-modification runtime at the beginning of a module.
+
+        Generates the runtime code and inserts it after any ``__future__``
+        imports and module docstrings to preserve module semantics.
+
+        Args:
+            module: The Python AST Module node to inject into.
+        """
+        if self.runtime_injected:
+            return
+
+        try:
+            from obfuscator.processors.self_modify_runtime_python import (
+                generate_python_self_modify_runtime,
+            )
+
+            runtime_code = generate_python_self_modify_runtime(self.complexity)
+            runtime_tree = ast.parse(runtime_code)
+            runtime_nodes = runtime_tree.body
+        except Exception as e:
+            error_msg = f"Failed to generate Python self-modify runtime: {e}"
+            self.errors.append(error_msg)
+            self.logger.error(error_msg)
+            return
+
+        # Find insertion point after __future__ imports and docstrings
+        insert_index = 0
+        for i, stmt in enumerate(module.body):
+            if isinstance(stmt, ast.ImportFrom) and stmt.module == '__future__':
+                insert_index = i + 1
+            elif (
+                i == 0
+                and isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+            ):
+                insert_index = 1
+            else:
+                break
+
+        # Insert runtime nodes at the calculated position
+        for j, rnode in enumerate(runtime_nodes):
+            ast.fix_missing_locations(rnode)
+            module.body.insert(insert_index + j, rnode)
+
+        self.runtime_injected = True
+        self.logger.debug(
+            f"Injected {len(runtime_nodes)} self-modify runtime statements "
+            f"at module level (index {insert_index})"
+        )
+
+    # ── Lua Transformation Methods ─────────────────────────────────────
+
+    def _make_lua_function_self_modifying(self, node: Any) -> Any:
+        """Transform a Lua function to use self-modification.
+
+        Extracts the function body, converts to a code string using
+        ``lua_ast.to_lua_source()``, and creates a wrapper using
+        ``loadstring()``/``load()`` for runtime redefinition.
+
+        Args:
+            node: Lua Function AST node to transform.
+
+        Returns:
+            Modified Lua AST node with self-modifying wrapper.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return node
+
+        try:
+            # Extract function body as Lua source
+            try:
+                body_source = lua_ast.to_lua_source(node)
+            except Exception:
+                body_source = "return nil"
+
+            # Get function name
+            func_name = None
+            if hasattr(node, 'name') and node.name:
+                if isinstance(node.name, lua_nodes.Name):
+                    func_name = node.name.id
+                elif isinstance(node.name, str):
+                    func_name = node.name
+
+            if func_name is None:
+                return node
+
+            # Create wrapper code that uses _redefine_function
+            wrapper_code = (
+                f'local _sm_result = _redefine_function("{func_name}", '
+                f'[[{body_source}]])\n'
+                f'if _sm_result ~= nil then return _sm_result(...) end'
+            )
+
+            # Parse the wrapper and replace the function body
+            try:
+                wrapper_tree = lua_ast.parse(wrapper_code)
+                if hasattr(wrapper_tree, 'body') and hasattr(wrapper_tree.body, 'body'):
+                    new_body = list(wrapper_tree.body.body)
+                    if hasattr(node, 'body') and hasattr(node.body, 'body'):
+                        node.body.body = new_body
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to parse Lua self-modify wrapper for '{func_name}': {e}"
+                )
+                return node
+
+            self.modified_functions.add(func_name)
+            self.transformation_count += 1
+            self.logger.debug(f"Made Lua function '{func_name}' self-modifying")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to make Lua function self-modifying: {e}")
+
+        return node
+
+    def _traverse_lua_ast_for_self_modify(self, node: Any) -> None:
+        """Traverse Lua AST and apply self-modification to eligible functions.
+
+        Detects ``lua_nodes.Function`` nodes with at least 3 statements in
+        their body and applies self-modification transformation.
+
+        Args:
+            node: Lua AST node to traverse.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        # Handle Chunk (module level)
+        if isinstance(node, lua_nodes.Chunk):
+            self.language_mode = "lua"
+
+        # Handle Function nodes
+        if isinstance(node, lua_nodes.Function):
+            # Check eligibility: body must have at least 3 statements
+            if hasattr(node, 'body') and hasattr(node.body, 'body'):
+                if len(node.body.body) >= 3:
+                    self._make_lua_function_self_modifying(node)
+
+        # Recursively traverse children
+        if hasattr(node, 'body') and isinstance(node.body, lua_nodes.Block):
+            for child in list(node.body.body):
+                self._traverse_lua_ast_for_self_modify(child)
+
+    def _inject_lua_runtime(self, chunk: Any) -> None:
+        """Inject Lua self-modification runtime at the beginning of a chunk.
+
+        Generates the runtime code and prepends it to the chunk body.
+
+        Args:
+            chunk: Lua AST Chunk node to inject into.
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        if self.runtime_injected:
+            return
+
+        try:
+            from obfuscator.processors.self_modify_runtime_lua import (
+                generate_lua_self_modify_runtime,
+            )
+
+            runtime_code = generate_lua_self_modify_runtime(self.complexity)
+            parsed = lua_ast.parse(runtime_code)
+
+            if hasattr(parsed, 'body') and hasattr(parsed.body, 'body'):
+                runtime_nodes = list(parsed.body.body)
+                if hasattr(chunk, 'body') and hasattr(chunk.body, 'body'):
+                    chunk.body.body = runtime_nodes + list(chunk.body.body)
+
+            self.runtime_injected = True
+            self.logger.debug(
+                "Injected Lua self-modify runtime at chunk level"
+            )
+
+        except Exception as e:
+            error_msg = f"Failed to inject Lua self-modify runtime: {e}"
+            self.errors.append(error_msg)
+            self.logger.error(error_msg)
+
+    # ── Transform Orchestration ─────────────────────────────────────────
+
+    def transform(self, ast_node: Union[ast.AST, Any]) -> TransformResult:
+        """Apply self-modifying code transformation to an AST.
+
+        Orchestrates the full transformation pipeline:
+        1. Reset state for this run
+        2. Detect language from AST node type
+        3. Visit/traverse functions and apply self-modification
+        4. Inject self-modification runtime at module/chunk start
+        5. Fix missing locations
+        6. Return structured result
+
+        Args:
+            ast_node: The AST node to transform (``ast.Module`` for Python
+                     or ``lua_nodes.Chunk`` for Lua).
+
+        Returns:
+            TransformResult with the transformed AST, success status,
+            transformation count, and any errors.
+        """
+        # Reset state
+        self.transformation_count = 0
+        self.errors = []
+        self.runtime_injected = False
+        self.modified_functions.clear()
+
+        try:
+            self.logger.info(
+                f"Starting self-modifying code transformation "
+                f"(complexity={self.complexity})"
+            )
+
+            if isinstance(ast_node, ast.Module):
+                self.language_mode = 'python'
+                self.logger.debug(
+                    "Detected Python language mode for self-modifying code"
+                )
+
+                # Fix missing locations before transformation
+                ast.fix_missing_locations(ast_node)
+
+                # Apply Python transformations by visiting the AST
+                transformed_node = self.visit(ast_node)
+
+                if transformed_node is None:
+                    raise ValueError("Transformation returned None")
+
+                # Inject runtime AFTER transformation to avoid modifying runtime code
+                if self.transformation_count > 0:
+                    self._inject_python_runtime(transformed_node)
+
+                # Fix missing locations on newly created nodes
+                ast.fix_missing_locations(transformed_node)
+
+            elif LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk):
+                self.language_mode = 'lua'
+                self.logger.debug(
+                    "Detected Lua language mode for self-modifying code"
+                )
+
+                # Apply Lua transformations using custom traversal
+                self._traverse_lua_ast_for_self_modify(ast_node)
+
+                # Inject runtime AFTER transformation
+                if self.transformation_count > 0:
+                    self._inject_lua_runtime(ast_node)
+
+                transformed_node = ast_node
+
+            else:
+                error_msg = (
+                    f"Unsupported AST node type: "
+                    f"{type(ast_node).__name__ if ast_node is not None else 'None'}"
+                )
+                self.logger.error(error_msg)
+                return TransformResult(
+                    ast_node=None,
+                    success=False,
+                    transformation_count=0,
+                    errors=[error_msg],
+                )
+
+            self.logger.info(
+                f"Self-modifying code transformation completed: "
+                f"{self.transformation_count} functions modified, "
+                f"functions: {self.modified_functions}"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = (
+                f"Self-modifying code transformation failed: "
+                f"{e.__class__.__name__}: {e}"
+            )
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
