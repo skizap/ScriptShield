@@ -12,8 +12,12 @@ The transformation order is:
 5. DeadCodeInjectionTransformer (dead_code_injection)
 6. OpaquePredicatesTransformer (opaque_predicates)
 7. AntiDebuggingTransformer (anti_debugging)
-8. MangleIndexesTransformer (mangle_indexes)
-9. VMProtectionTransformer (vm_protection)
+8. RobloxExploitDefenseTransformer (roblox_exploit_defense)
+9. RobloxRemoteSpyTransformer (roblox_remote_spy)
+10. CodeSplittingTransformer (code_splitting)
+11. SelfModifyingCodeTransformer (self_modifying_code)
+12. MangleIndexesTransformer (mangle_indexes)
+13. VMProtectionTransformer (vm_protection)
 
 This ensures that value-level obfuscation (strings, numbers, arrays) happens
 before structural changes (index mangling, VM wrapping).
@@ -48,6 +52,8 @@ from obfuscator.processors.ast_transformer import (
     MangleIndexesTransformer,
     NumberObfuscationTransformer,
     OpaquePredicatesTransformer,
+    RobloxExploitDefenseTransformer,
+    RobloxRemoteSpyTransformer,
     StringEncryptionTransformer,
     TransformResult,
     VMProtectionTransformer,
@@ -87,6 +93,8 @@ class ObfuscationEngine:
         ("dead_code_injection", DeadCodeInjectionTransformer),
         ("opaque_predicates", OpaquePredicatesTransformer),
         ("anti_debugging", AntiDebuggingTransformer),
+        ("roblox_exploit_defense", RobloxExploitDefenseTransformer),
+        ("roblox_remote_spy", RobloxRemoteSpyTransformer),
         ("code_splitting", CodeSplittingTransformer),
         ("self_modifying_code", SelfModifyingCodeTransformer),
         ("mangle_indexes", MangleIndexesTransformer),

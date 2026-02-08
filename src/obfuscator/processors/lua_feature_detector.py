@@ -227,13 +227,28 @@ class LuaFeatureDetector(ast.ASTVisitor):
             func_name: Extracted function name
         """
         if self._is_roblox_preserved_api(func_name, node.args):
-            self._add_warning(
-                node,
-                feature_name=f"Roblox API: {func_name}",
-                description="Roblox API pattern detected; these names should be preserved during obfuscation",
-                severity="warning",
-                suggestion="Verify that Roblox API names and service strings are in the preservation list"
+            # Check if it's a remote method call that would benefit from remote spy protection
+            is_remote_method = any(
+                func_name and (func_name.endswith(f":{m}") or func_name.endswith(f".{m}"))
+                for m in ["FireServer", "FireClient", "InvokeServer", "InvokeClient"]
             )
+            
+            if is_remote_method:
+                self._add_warning(
+                    node,
+                    feature_name=f"Roblox Remote API: {func_name}",
+                    description="RemoteEvent/RemoteFunction call detected; consider enabling roblox_remote_spy feature for protection",
+                    severity="warning",
+                    suggestion="Enable 'roblox_remote_spy' feature in obfuscation config to protect remote calls from interception"
+                )
+            else:
+                self._add_warning(
+                    node,
+                    feature_name=f"Roblox API: {func_name}",
+                    description="Roblox API pattern detected; these names should be preserved during obfuscation",
+                    severity="warning",
+                    suggestion="Verify that Roblox API names and service strings are in the preservation list"
+                )
 
     def visit_Index(self, node: astnodes.Index) -> None:
         """Visit index nodes to detect _G global table access.
@@ -293,6 +308,11 @@ class LuaFeatureDetector(ast.ASTVisitor):
 
         # Check for Instance.new() or Instance:new()
         if call_name in ("Instance.new", "Instance:new"):
+            return True
+
+        # Check for RemoteEvent/RemoteFunction method calls (FireServer, FireClient, InvokeServer, InvokeClient)
+        if call_name and any(call_name.endswith(f":{m}") or call_name.endswith(f".{m}") 
+                            for m in ["FireServer", "FireClient", "InvokeServer", "InvokeClient"]):
             return True
 
         # Check for common Roblox services in arguments

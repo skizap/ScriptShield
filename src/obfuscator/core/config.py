@@ -131,6 +131,8 @@ class ObfuscationConfig:
         "code_split_chunk_size": 5,
         "code_split_encryption": True,
         "self_modify_complexity": 2,
+        "roblox_exploit_aggressiveness": 2,
+        "roblox_exploit_action": "exit",
     })
     symbol_table_options: Dict[str, Any] = field(default_factory=lambda: {
         "identifier_prefix": "_0x",
@@ -301,6 +303,25 @@ class ObfuscationConfig:
             if not 1 <= aggressiveness <= 3:
                 raise ValueError(
                     "Option 'anti_debug_aggressiveness' must be between 1 and 3"
+                )
+
+        # Roblox exploit defense options validation
+        if "roblox_exploit_aggressiveness" in self.options:
+            aggressiveness = self.options["roblox_exploit_aggressiveness"]
+            if not isinstance(aggressiveness, int):
+                raise ValueError(
+                    "Option 'roblox_exploit_aggressiveness' must be an integer"
+                )
+            if not 1 <= aggressiveness <= 3:
+                raise ValueError(
+                    "Option 'roblox_exploit_aggressiveness' must be between 1 and 3"
+                )
+
+        if "roblox_exploit_action" in self.options:
+            action = self.options["roblox_exploit_action"]
+            if action not in ("exit", "loop", "exception"):
+                raise ValueError(
+                    "Option 'roblox_exploit_action' must be 'exit', 'loop', or 'exception'"
                 )
 
         # Code splitting options validation

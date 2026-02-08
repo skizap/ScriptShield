@@ -5770,6 +5770,959 @@ class AntiDebuggingTransformer(ASTTransformer):
             )
 
 
+class RobloxExploitDefenseTransformer(ASTTransformer):
+    """AST transformer that injects Roblox exploit defense checks into Lua code.
+
+    This transformer adds exploit detection, script integrity verification, and
+    environment fingerprinting code to Lua scripts targeting the Roblox platform.
+    It detects and responds to common exploit executors including:
+
+    - Synapse X (syn global)
+    - KRNL (KRNL_LOADED global)
+    - Script-Ware (getgenv, getrawmetatable)
+    - Common exploit functions (gethui, hookfunction, hookmetamethod)
+
+    Injection points depend on the aggressiveness level:
+    - Level 1 (Minimal): Exploit executor detection only
+    - Level 2 (Moderate): Executor detection + script integrity hash checks
+    - Level 3 (Aggressive): All checks + environment fingerprinting + metatable tampering detection
+
+    This transformer only applies to Lua files and gracefully skips Python ASTs.
+
+    Args:
+        config: Optional obfuscation configuration
+        roblox_exploit_aggressiveness: Level of defense checks (1-3), overrides config
+
+    Example:
+        >>> transformer = RobloxExploitDefenseTransformer(roblox_exploit_aggressiveness=2)
+        >>> result = transformer.transform(lua_chunk)
+        >>> if result.success:
+        ...     print(f"Injected {result.transformation_count} exploit defense checks")
+
+    Note:
+        Runtime detection code uses obfuscated function names with hex suffixes
+        to avoid easy pattern matching by exploit authors.
+    """
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        roblox_exploit_aggressiveness: Optional[int] = None,
+        script_hash: Optional[int] = None,
+    ):
+        """Initialize the Roblox exploit defense transformer.
+
+        Args:
+            config: Optional obfuscation configuration
+            roblox_exploit_aggressiveness: Override aggressiveness level (1-3)
+            script_hash: Pre-computed script hash for deterministic testing
+        """
+        super().__init__()
+        self.config = config
+        self.language_mode = "lua"
+        self.injection_count = 0
+        self.logger = get_logger("obfuscator.processors.roblox_exploit_defense")
+        self._runtime_injected = False
+        self.script_hash = script_hash
+
+        # Extract aggressiveness from config or use parameter/default
+        if roblox_exploit_aggressiveness is not None:
+            self.aggressiveness = roblox_exploit_aggressiveness
+        elif config is not None and hasattr(config, 'options'):
+            self.aggressiveness = config.options.get('roblox_exploit_aggressiveness', 2)
+        else:
+            self.aggressiveness = 2
+
+        # Validate and clamp to valid range
+        if not isinstance(self.aggressiveness, int):
+            self.aggressiveness = 2
+        self.aggressiveness = max(1, min(3, self.aggressiveness))
+
+    def _should_inject_at_function_entry(self) -> bool:
+        """Determine if exploit defense checks should be added at function entry points.
+
+        Returns:
+            True if checks should be injected at function entries
+        """
+        return self.aggressiveness >= 2
+
+    def _should_inject_at_critical_points(self) -> bool:
+        """Determine if checks should be added at critical points like loops.
+
+        Returns:
+            True if checks should be injected at critical points
+        """
+        return self.aggressiveness >= 3
+
+    def _compute_script_hash(self, source_code: str) -> int:
+        """Compute a hash of the source code using the same algorithm as the runtime.
+
+        Uses a simple polynomial rolling hash matching the Lua runtime implementation.
+
+        Args:
+            source_code: The script source code to hash
+
+        Returns:
+            Integer hash value
+        """
+        h = 0
+        for ch in source_code:
+            h = (h * 31 + ord(ch)) % 2147483647
+        return h
+
+    def _inject_roblox_runtime(self) -> list[Any]:
+        """Generate and parse Roblox exploit defense runtime code.
+
+        Returns:
+            List of Lua AST nodes for the runtime code
+        """
+        if not LUAPARSER_AVAILABLE:
+            return []
+
+        try:
+            from obfuscator.processors.roblox_exploit_runtime_lua import (
+                generate_roblox_exploit_defense_checks
+            )
+
+            # Determine defensive action from config
+            action = "exit"
+            if self.config is not None and hasattr(self.config, 'options'):
+                action = self.config.options.get('roblox_exploit_action', 'exit')
+
+            runtime_code = generate_roblox_exploit_defense_checks(
+                aggressiveness=self.aggressiveness,
+                action=action,
+                script_hash=self.script_hash,
+            )
+            parsed = lua_ast.parse(runtime_code)
+            return list(parsed.body.body) if hasattr(parsed.body, 'body') else []
+        except Exception as e:
+            self.logger.warning(f"Failed to generate Roblox exploit defense runtime: {e}")
+            return []
+
+    def _create_roblox_check_call(self) -> Any:
+        """Create Lua AST node for calling the main Roblox exploit defense check function.
+
+        Returns:
+            Lua AST call statement, or None if luaparser is unavailable
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        try:
+            call_node = lua_nodes.Call(
+                func=lua_nodes.Name(id='_roblox_check_0x1f3a'),
+                args=lua_nodes.Expressions()
+            )
+            return lua_nodes.CallStatement(call_node)
+        except Exception as e:
+            self.logger.warning(f"Failed to create Roblox exploit defense call: {e}")
+            return None
+
+    def get_injected_function_names(self) -> list[str]:
+        """Return the names of functions injected by the runtime.
+
+        Useful for testing and verification.
+
+        Returns:
+            List of injected function name strings
+        """
+        names = [
+            "_roblox_defensive_0x5a7b",
+            "_exploit_detect_0x2b4c",
+            "_roblox_check_0x1f3a",
+        ]
+        if self.aggressiveness >= 2:
+            names.extend([
+                "_compute_hash_0x6c8d",
+                "_integrity_verify_0x3d5e",
+            ])
+        if self.aggressiveness >= 3:
+            names.append("_env_fingerprint_0x4f6a")
+        return names
+
+    def _generate_indirection_stubs(self) -> list[Any]:
+        """Generate Lua AST nodes for indirection stubs that wrap sensitive globals.
+
+        Creates local aliases that access commonly targeted globals via indirect
+        ``_G`` lookups, making them harder to detect via simple pattern matching.
+
+        Returns:
+            List of Lua AST nodes for indirection stub declarations
+        """
+        if not LUAPARSER_AVAILABLE:
+            return []
+
+        # Build Lua code that creates indirect access stubs for sensitive globals
+        sensitive_globals = [
+            ("_roblox_g_ref_0x01", "game"),
+            ("_roblox_g_ref_0x02", "workspace"),
+            ("_roblox_g_ref_0x03", "script"),
+            ("_roblox_g_ref_0x04", "Instance"),
+        ]
+        lines = []
+        for alias, global_name in sensitive_globals:
+            lines.append(f'local {alias} = _G["{global_name}"]')
+
+        # Add indirection wrapper functions for commonly hooked APIs
+        wrapper_funcs = [
+            ("_roblox_svc_0x01", "GetService", "game"),
+            ("_roblox_find_0x01", "FindFirstChild", "workspace"),
+        ]
+        for func_alias, method_name, target in wrapper_funcs:
+            lines.append(
+                f'local function {func_alias}(...) '
+                f'return _G["{target}"]["{method_name}"](_G["{target}"], ...) end'
+            )
+
+        stub_code = "\n".join(lines)
+        try:
+            parsed = lua_ast.parse(stub_code)
+            return list(parsed.body.body) if hasattr(parsed.body, 'body') else []
+        except Exception as e:
+            self.logger.warning(f"Failed to generate indirection stubs: {e}")
+            return []
+
+    def _obfuscate_exploit_patterns(self, node: Any) -> None:
+        """Rewrite exploit-targeted patterns in the AST with indirect access.
+
+        Walks the AST looking for direct references to sensitive globals
+        (``game``, ``workspace``, ``script``, ``Instance``) used outside of
+        the injected runtime code, and rewrites them to use ``_G["name"]``
+        indirect access to frustrate simple string-based detection.
+
+        Args:
+            node: Lua AST node to process (typically the Chunk)
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        sensitive_names = {"game", "workspace", "script", "Instance"}
+
+        def _rewrite_names(n: Any) -> None:
+            """Recursively rewrite Name nodes referencing sensitive globals."""
+            if isinstance(n, lua_nodes.Name) and getattr(n, 'id', None) in sensitive_names:
+                # Skip names inside our own injected runtime functions
+                name_id = n.id
+                # Rewrite: Name(id="game") -> Index(value=Name(id="_G"), idx=String("game"))
+                try:
+                    new_node = lua_nodes.Index(
+                        value=lua_nodes.Name(id='_G'),
+                        idx=lua_nodes.String(s=name_id, delimiter='"'),
+                    )
+                    n.__class__ = new_node.__class__
+                    n.__dict__.update(new_node.__dict__)
+                    self.transformation_count += 1
+                except Exception:
+                    pass  # Leave node unchanged on error
+
+            # Recurse into child attributes
+            for attr_name in ('body', 'func', 'args', 'value', 'values',
+                              'target', 'targets', 'source', 'idx',
+                              'left', 'right', 'test', 'orelse'):
+                child = getattr(n, attr_name, None)
+                if child is None:
+                    continue
+                if isinstance(child, lua_nodes.Block):
+                    for stmt in list(child.body):
+                        _rewrite_names(stmt)
+                elif isinstance(child, lua_nodes.Expressions):
+                    for expr in list(child.expressions) if hasattr(child, 'expressions') else []:
+                        _rewrite_names(expr)
+                elif isinstance(child, list):
+                    for item in child:
+                        _rewrite_names(item)
+                elif hasattr(child, '__dict__'):
+                    _rewrite_names(child)
+
+        # Walk all statements in the chunk body, skipping injected runtime
+        if hasattr(node, 'body') and isinstance(node.body, lua_nodes.Block):
+            for stmt in node.body.body:
+                _rewrite_names(stmt)
+
+    def _traverse_lua_ast_for_roblox_defense(self, node: Any, parent: Any = None) -> None:
+        """Traverse Lua AST and inject Roblox exploit defense checks.
+
+        Args:
+            node: Lua AST node to traverse
+            parent: Parent node for context
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        # Handle Chunk (module level)
+        if isinstance(node, lua_nodes.Chunk):
+            self.language_mode = "lua"
+
+            # Inject runtime at chunk level
+            if not self._runtime_injected:
+                runtime_statements = self._inject_roblox_runtime()
+                if runtime_statements:
+                    if hasattr(node.body, 'body'):
+                        node.body.body = runtime_statements + list(node.body.body)
+                    self._runtime_injected = True
+                    self.logger.debug(f"Injected {len(runtime_statements)} Roblox defense runtime statements at chunk level")
+
+                # Always inject a top-level check call after the runtime
+                # so exploit detection runs at script entry (all levels)
+                entry_call = self._create_roblox_check_call()
+                if entry_call and hasattr(node.body, 'body'):
+                    node.body.body.append(entry_call)
+                    # Move the call right after the runtime statements
+                    # (it was appended, now rotate it into position)
+                    body = node.body.body
+                    call_node = body.pop()
+                    insert_pos = len(runtime_statements) if runtime_statements else 0
+                    body.insert(insert_pos, call_node)
+                    self.injection_count += 1
+                    self.transformation_count += 1
+                    self.logger.debug("Injected Roblox exploit defense check at chunk entry")
+
+            # Inject indirection stubs for exploit-targeted patterns
+            indirection_stubs = self._generate_indirection_stubs()
+            if indirection_stubs and hasattr(node.body, 'body'):
+                # Insert stubs after runtime + entry call
+                runtime_count = 0
+                if self._runtime_injected:
+                    # Count injected runtime statements + 1 entry call
+                    runtime_count = len([s for s in node.body.body[:50]
+                                        if hasattr(s, '__class__')])
+                # Insert right after runtime block
+                insert_idx = min(len(node.body.body), runtime_count)
+                for i, stub in enumerate(indirection_stubs):
+                    node.body.body.insert(insert_idx + i, stub)
+                self.transformation_count += len(indirection_stubs)
+                self.logger.debug(f"Injected {len(indirection_stubs)} indirection stubs at chunk level")
+
+            # Obfuscate exploit-targeted patterns in user code
+            self._obfuscate_exploit_patterns(node)
+
+        # Handle Function nodes
+        if isinstance(node, lua_nodes.Function):
+            if self._should_inject_at_function_entry():
+                check_call = self._create_roblox_check_call()
+                if check_call and hasattr(node, 'body') and hasattr(node.body, 'body'):
+                    node.body.body.insert(0, check_call)
+                    self.injection_count += 1
+                    self.transformation_count += 1
+                    self.logger.debug("Injected Roblox exploit defense check at Lua function entry")
+
+        # Handle loops at critical points (aggressive mode)
+        if isinstance(node, (lua_nodes.While, lua_nodes.Fornum, lua_nodes.Forin)):
+            if self._should_inject_at_critical_points():
+                check_call = self._create_roblox_check_call()
+                if check_call and hasattr(node, 'body') and hasattr(node.body, 'body'):
+                    node.body.body.insert(0, check_call)
+                    self.injection_count += 1
+                    self.transformation_count += 1
+                    self.logger.debug("Injected Roblox exploit defense check at Lua loop entry")
+
+        # Recursively traverse children
+        if hasattr(node, 'body') and isinstance(node.body, lua_nodes.Block):
+            for i, child in enumerate(node.body.body):
+                self._traverse_lua_ast_for_roblox_defense(child, node)
+
+    def transform(self, ast_node: Union[ast.AST, Any]) -> TransformResult:
+        """Transform AST by injecting Roblox exploit defense checks.
+
+        Only applies to Lua ASTs. Python ASTs are returned unchanged with
+        zero transformations.
+
+        Args:
+            ast_node: Python or Lua AST node to transform
+
+        Returns:
+            TransformResult with the transformed AST and status information
+        """
+        try:
+            # Skip Python files gracefully
+            if isinstance(ast_node, ast.Module):
+                return TransformResult(
+                    ast_node=ast_node,
+                    success=True,
+                    transformation_count=0,
+                    errors=[],
+                )
+
+            if not (LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk)):
+                error_msg = f"Unsupported AST node type: {type(ast_node).__name__ if ast_node is not None else 'None'}"
+                self.logger.error(error_msg)
+                return TransformResult(
+                    ast_node=None,
+                    success=False,
+                    transformation_count=0,
+                    errors=[error_msg],
+                )
+
+            self.logger.info(
+                f"Starting Roblox exploit defense injection (aggressiveness={self.aggressiveness})"
+            )
+
+            self.language_mode = "lua"
+
+            # Compute script hash from current source for integrity checks
+            if self.script_hash is None and self.aggressiveness >= 2:
+                try:
+                    source_code = lua_ast.to_lua_source(ast_node)
+                    if source_code:
+                        self.script_hash = self._compute_script_hash(source_code)
+                        self.logger.debug(f"Computed script hash: {self.script_hash}")
+                except Exception as e:
+                    self.logger.warning(f"Could not compute script hash: {e}")
+
+            # Apply Lua transformations using custom traversal
+            self._traverse_lua_ast_for_roblox_defense(ast_node)
+
+            # Lua transformation is in-place
+            transformed_node = ast_node
+
+            self.logger.info(
+                f"Roblox exploit defense injection completed: "
+                f"{self.transformation_count} checks injected"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = f"Roblox exploit defense injection failed: {e.__class__.__name__}: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+
+class RobloxRemoteSpyTransformer(ASTTransformer):
+    """AST transformer that protects RemoteEvent/RemoteFunction calls from remote spy exploits.
+
+    This transformer detects RemoteEvent and RemoteFunction method calls (FireServer,
+    FireClient, InvokeServer, InvokeClient) and encrypts the remote object names.
+    It replaces direct remote references with dynamic lookups that decrypt names at
+    runtime, making it harder for remote spy exploits to intercept and log remote traffic.
+
+    The transformer:
+    1. Detects remote method calls using colon syntax (e.g., `myRemote:FireServer()`)
+    2. Encrypts remote object names using XOR cipher
+    3. Injects runtime code with decryption function and lookup table
+    4. Replaces direct remote references with dynamic resolver calls
+    5. Caches resolved remotes to avoid repeated lookups
+
+    This transformer only applies to Lua files targeting the Roblox platform.
+
+    Args:
+        config: Optional obfuscation configuration
+        encryption_key: Optional pre-generated encryption key (16 bytes)
+
+    Example:
+        >>> transformer = RobloxRemoteSpyTransformer()
+        >>> result = transformer.transform(lua_chunk)
+        >>> if result.success:
+        ...     print(f"Protected {result.transformation_count} remote calls")
+
+    Note:
+        Runtime protection code uses obfuscated function names with hex suffixes
+        to avoid easy pattern matching by exploit authors.
+    """
+
+    def __init__(
+        self,
+        config: Optional[Any] = None,
+        encryption_key: Optional[bytes] = None,
+    ):
+        """Initialize the Roblox remote spy protection transformer.
+
+        Args:
+            config: Optional obfuscation configuration
+            encryption_key: Optional 16-byte encryption key for testing
+        """
+        super().__init__()
+        self.config = config
+        self.language_mode = "lua"
+        self.logger = get_logger("obfuscator.processors.roblox_remote_spy")
+        self._runtime_injected = False
+        self.remote_name_map: dict[str, str] = {}
+        self._detected_remotes: set[str] = set()
+
+        # Generate or use provided encryption key
+        if encryption_key is not None:
+            self.encryption_key = encryption_key
+        else:
+            self.encryption_key = secrets.token_bytes(16)
+
+    def _is_remote_method_call(self, node: Any) -> tuple[bool, str | None]:
+        """Check if a node is a RemoteEvent/RemoteFunction method call.
+
+        Args:
+            node: Lua AST node to check
+
+        Returns:
+            Tuple of (is_remote_call, method_name) where method_name is one of
+            FireServer, FireClient, InvokeServer, InvokeClient, or None
+        """
+        if not LUAPARSER_AVAILABLE:
+            return False, None
+
+        # Check if it's an Invoke node (method call with colon syntax)
+        if not isinstance(node, lua_nodes.Invoke):
+            return False, None
+
+        # Extract method name from the func field
+        func = getattr(node, 'func', None)
+        if func is None:
+            return False, None
+
+        # Get method name from func attribute
+        method_name = None
+        if hasattr(func, 'id'):
+            method_name = func.id
+        elif hasattr(func, 'name'):
+            method_name = func.name
+
+        if method_name is None:
+            return False, None
+
+        # Check if it's a remote method
+        remote_methods = ["FireServer", "FireClient", "InvokeServer", "InvokeClient"]
+        if method_name in remote_methods:
+            return True, method_name
+
+        return False, None
+
+    def _extract_remote_object_name(self, node: Any) -> str | None:
+        """Extract the remote object name from an Invoke node.
+
+        Handles:
+        - Simple variables: `myRemote:FireServer()`
+        - Indexed access: `remotes.playerJoined:FireServer()`
+
+        Args:
+            node: The Invoke AST node
+
+        Returns:
+            String identifier for the remote object, or None if cannot extract
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        # Get the source object (the thing before the colon)
+        # In luaparser, Invoke nodes have a 'source' attribute for the object
+        source = getattr(node, 'source', None)
+        if source is None:
+            return None
+
+        # Handle simple Name nodes (e.g., myRemote)
+        if isinstance(source, lua_nodes.Name):
+            name_id = getattr(source, 'id', None)
+            # Skip Roblox API globals
+            if name_id in {"game", "workspace", "script", "Instance"}:
+                return None
+            return name_id
+
+        # Handle Index nodes (e.g., remotes.playerJoined)
+        if isinstance(source, lua_nodes.Index):
+            # Use table/field (luaparser 4.x) with fallback to value/idx
+            table_node = getattr(source, 'table', None) or getattr(source, 'value', None)
+            field_node = getattr(source, 'field', None) or getattr(source, 'idx', None)
+
+            table_part = None
+            if isinstance(table_node, lua_nodes.Name):
+                table_part = table_node.id
+
+            field_part = None
+            if field_node is not None:
+                if isinstance(field_node, lua_nodes.String):
+                    field_part = field_node.s
+                elif isinstance(field_node, lua_nodes.Name):
+                    field_part = field_node.id
+
+            if table_part and field_part:
+                # Skip if table is a Roblox API global
+                if table_part in {"game", "workspace", "script", "Instance"}:
+                    return None
+                return f"{table_part}.{field_part}"
+
+        return None
+
+    def _encrypt_remote_name(self, name: str) -> str:
+        """Encrypt a remote name using XOR cipher.
+
+        Args:
+            name: The remote object name to encrypt
+
+        Returns:
+            Base64-encoded encrypted bytes as string
+        """
+        name_bytes = name.encode('utf-8')
+        key_bytes = self.encryption_key
+        key_len = len(key_bytes)
+
+        encrypted = bytes(
+            name_bytes[i] ^ key_bytes[i % key_len]
+            for i in range(len(name_bytes))
+        )
+
+        # Return base64-encoded for safe Lua embedding
+        import base64
+        return base64.b64encode(encrypted).decode('ascii')
+
+    def _inject_remote_spy_runtime(self) -> list[Any]:
+        """Generate and parse Roblox remote spy protection runtime code.
+
+        Returns:
+            List of Lua AST nodes for the runtime code
+        """
+        if not LUAPARSER_AVAILABLE:
+            return []
+
+        try:
+            from obfuscator.processors.roblox_remote_spy_runtime_lua import (
+                generate_roblox_remote_spy_runtime,
+            )
+
+            runtime_code = generate_roblox_remote_spy_runtime(
+                encryption_key=self.encryption_key,
+                remote_name_map=self.remote_name_map,
+            )
+            parsed = lua_ast.parse(runtime_code)
+            return list(parsed.body.body) if hasattr(parsed.body, 'body') else []
+        except Exception as e:
+            self.logger.warning(f"Failed to generate Roblox remote spy runtime: {e}")
+            return []
+
+    def _create_remote_lookup_call(self, encrypted_key: str) -> Any:
+        """Create Lua AST node for a remote resolver call.
+
+        Args:
+            encrypted_key: The encrypted key for the remote name lookup
+
+        Returns:
+            Lua AST Call node for _resolve_remote_0x6a5f(encrypted_key)
+        """
+        if not LUAPARSER_AVAILABLE:
+            return None
+
+        try:
+            call_node = lua_ast.parse(f'_resolve_remote_0x6a5f("{encrypted_key}")')
+            # Extract the expression from the parsed statement
+            if hasattr(call_node.body, 'body') and len(call_node.body.body) > 0:
+                stmt = call_node.body.body[0]
+                if hasattr(stmt, 'expression'):
+                    return stmt.expression
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to create remote lookup call: {e}")
+            return None
+
+    def _obfuscate_remote_arguments(self, node: Any) -> None:
+        """Obfuscate remote call arguments with semantics-preserving wrappers.
+
+        Wraps each argument in an identity expression to change the call
+        structure while preserving runtime behavior. This makes the call
+        pattern harder for remote spy exploits to detect.
+
+        Args:
+            node: The Invoke AST node (remote method call)
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        args = getattr(node, 'args', None)
+        if not args or not isinstance(args, lua_nodes.Expressions):
+            return
+
+        expressions = getattr(args, 'expressions', None)
+        if not expressions:
+            return
+
+        # List of identity wrapper patterns to use
+        # These preserve semantics but change AST structure
+        wrapper_patterns = [
+            '(function(x) return x end)({})',  # Identity function wrapper
+            '({} + 0)',                           # Add zero
+            '({} - 0)',                           # Subtract zero
+            '({} * 1)',                           # Multiply by one
+            '({} ^ 1)',                           # Power of one
+            '(-(-{}))',                           # Double negation
+        ]
+
+        import random
+
+        for i, arg in enumerate(expressions):
+            try:
+                # Skip nil arguments
+                if arg is None:
+                    continue
+
+                # Pick a random wrapper pattern
+                pattern = random.choice(wrapper_patterns)
+                wrapper_code = pattern.format('__ARG_PLACEHOLDER__')
+
+                # Parse the wrapper and replace placeholder with actual argument
+                parsed = lua_ast.parse(f'return {wrapper_code}')
+
+                # Extract the return expression
+                if (hasattr(parsed.body, 'body') and
+                    len(parsed.body.body) > 0 and
+                    hasattr(parsed.body.body[0], 'expression')):
+
+                    wrapped_expr = parsed.body.body[0].expression
+
+                    # Find and replace the placeholder in the wrapped expression
+                    self._replace_placeholder_in_expr(wrapped_expr, '__ARG_PLACEHOLDER__', arg)
+
+                    # Replace the original argument
+                    expressions[i] = wrapped_expr
+                    self.transformation_count += 1
+                    self.logger.debug(f"Obfuscated remote call argument {i}")
+
+            except Exception as e:
+                # On error, leave argument unchanged
+                self.logger.debug(f"Failed to obfuscate argument {i}: {e}")
+                continue
+
+    def _replace_placeholder_in_expr(self, expr: Any, placeholder: str, replacement: Any) -> bool:
+        """Recursively replace a placeholder name with an expression in an AST node.
+
+        Args:
+            expr: The expression AST node to search
+            placeholder: The placeholder string to replace
+            replacement: The replacement AST node
+
+        Returns:
+            True if replacement was made
+        """
+        if not LUAPARSER_AVAILABLE:
+            return False
+
+        # Check if this is the placeholder Name node
+        if isinstance(expr, lua_nodes.Name):
+            if getattr(expr, 'id', None) == placeholder:
+                # Replace this node
+                expr.__class__ = replacement.__class__
+                expr.__dict__.clear()
+                expr.__dict__.update(replacement.__dict__)
+                return True
+            return False
+
+        # Recursively check child attributes
+        replaced = False
+        for attr_name in ('value', 'left', 'right', 'expression', 'func', 'args'):
+            child = getattr(expr, attr_name, None)
+            if child is not None:
+                if isinstance(child, lua_nodes.Name):
+                    if getattr(child, 'id', None) == placeholder:
+                        setattr(expr, attr_name, replacement)
+                        replaced = True
+                elif hasattr(child, '__dict__'):
+                    if self._replace_placeholder_in_expr(child, placeholder, replacement):
+                        replaced = True
+
+        # Handle list attributes (like args.expressions)
+        if hasattr(expr, 'expressions') and isinstance(expr.expressions, list):
+            for idx, item in enumerate(expr.expressions):
+                if isinstance(item, lua_nodes.Name):
+                    if getattr(item, 'id', None) == placeholder:
+                        expr.expressions[idx] = replacement
+                        replaced = True
+
+        return replaced
+
+    def _traverse_lua_ast_for_remote_spy(self, node: Any, parent: Any = None) -> None:
+        """Traverse Lua AST and apply remote spy protection transformations.
+
+        Args:
+            node: Lua AST node to traverse
+            parent: Parent node for context
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        # Handle Chunk (module level) - inject runtime
+        if isinstance(node, lua_nodes.Chunk):
+            self.language_mode = "lua"
+
+            # Collect all remote calls first
+            self._collect_remote_calls(node)
+
+            # Inject runtime at chunk level if we found remotes and haven't injected yet
+            if self._detected_remotes and not self._runtime_injected:
+                runtime_statements = self._inject_remote_spy_runtime()
+                if runtime_statements and hasattr(node.body, 'body'):
+                    node.body.body = runtime_statements + list(node.body.body)
+                    self._runtime_injected = True
+                    self.logger.debug(
+                        f"Injected {len(runtime_statements)} remote spy protection "
+                        f"runtime statements at chunk level"
+                    )
+
+        # Handle Invoke nodes (method calls with colon syntax)
+        if isinstance(node, lua_nodes.Invoke):
+            is_remote, method_name = self._is_remote_method_call(node)
+            if is_remote:
+                remote_name = self._extract_remote_object_name(node)
+                if remote_name:
+                    # Generate encrypted key and add to lookup table
+                    encrypted_key = self._encrypt_remote_name(f"key_{remote_name}")
+                    encrypted_name = self._encrypt_remote_name(remote_name)
+                    self.remote_name_map[encrypted_key] = encrypted_name
+                    self._detected_remotes.add(remote_name)
+
+                    # Replace the source with a dynamic lookup call
+                    lookup_call = self._create_remote_lookup_call(encrypted_key)
+                    if lookup_call:
+                        # Replace the source node
+                        node.source = lookup_call
+                        self.transformation_count += 1
+                        self.logger.debug(
+                            f"Replaced remote reference '{remote_name}' with dynamic lookup"
+                        )
+
+                    # Obfuscate arguments to change call structure while preserving semantics
+                    self._obfuscate_remote_arguments(node)
+
+        # Recursively traverse children
+        if hasattr(node, 'body') and isinstance(node.body, lua_nodes.Block):
+            for i, child in enumerate(node.body.body):
+                self._traverse_lua_ast_for_remote_spy(child, node)
+
+        # Also traverse other child attributes that might contain nodes
+        for attr_name in ('func', 'args', 'value', 'values', 'target', 'targets',
+                         'source', 'left', 'right', 'test', 'orelse', 'key'):
+            child = getattr(node, attr_name, None)
+            if child is None:
+                continue
+            if isinstance(child, lua_nodes.Block):
+                for stmt in list(child.body):
+                    self._traverse_lua_ast_for_remote_spy(stmt, node)
+            elif isinstance(child, lua_nodes.Expressions):
+                for expr in list(child.expressions) if hasattr(child, 'expressions') else []:
+                    self._traverse_lua_ast_for_remote_spy(expr, node)
+            elif isinstance(child, list):
+                for item in child:
+                    self._traverse_lua_ast_for_remote_spy(item, node)
+            elif hasattr(child, '__dict__'):
+                self._traverse_lua_ast_for_remote_spy(child, node)
+
+    def _collect_remote_calls(self, node: Any) -> None:
+        """Pre-collect all remote calls to build the complete name map before injection.
+
+        Args:
+            node: Lua AST Chunk node to scan
+        """
+        if not LUAPARSER_AVAILABLE:
+            return
+
+        def scan_node(n: Any) -> None:
+            if isinstance(n, lua_nodes.Invoke):
+                is_remote, method_name = self._is_remote_method_call(n)
+                if is_remote:
+                    remote_name = self._extract_remote_object_name(n)
+                    if remote_name:
+                        encrypted_key = self._encrypt_remote_name(f"key_{remote_name}")
+                        encrypted_name = self._encrypt_remote_name(remote_name)
+                        self.remote_name_map[encrypted_key] = encrypted_name
+                        self._detected_remotes.add(remote_name)
+
+            # Recursively scan children
+            for attr_name in ('body', 'func', 'args', 'value', 'values',
+                            'target', 'targets', 'source', 'left', 'right',
+                            'test', 'orelse', 'key'):
+                child = getattr(n, attr_name, None)
+                if child is None:
+                    continue
+                if isinstance(child, lua_nodes.Block):
+                    for stmt in list(child.body):
+                        scan_node(stmt)
+                elif isinstance(child, lua_nodes.Expressions):
+                    for expr in list(child.expressions) if hasattr(child, 'expressions') else []:
+                        scan_node(expr)
+                elif isinstance(child, list):
+                    for item in child:
+                        scan_node(item)
+                elif hasattr(child, '__dict__'):
+                    scan_node(child)
+
+        if hasattr(node, 'body') and isinstance(node.body, lua_nodes.Block):
+            for stmt in node.body.body:
+                scan_node(stmt)
+
+    def transform(self, ast_node: Union[ast.AST, Any]) -> TransformResult:
+        """Transform AST by applying remote spy protection to RemoteEvent/RemoteFunction calls.
+
+        Only applies to Lua ASTs. Python ASTs are returned unchanged with
+        zero transformations.
+
+        Args:
+            ast_node: Python or Lua AST node to transform
+
+        Returns:
+            TransformResult with the transformed AST and status information
+        """
+        try:
+            # Skip Python files gracefully
+            if isinstance(ast_node, ast.Module):
+                return TransformResult(
+                    ast_node=ast_node,
+                    success=True,
+                    transformation_count=0,
+                    errors=[],
+                )
+
+            if not (LUAPARSER_AVAILABLE and isinstance(ast_node, lua_nodes.Chunk)):
+                error_msg = f"Unsupported AST node type: {type(ast_node).__name__ if ast_node is not None else 'None'}"
+                self.logger.error(error_msg)
+                return TransformResult(
+                    ast_node=None,
+                    success=False,
+                    transformation_count=0,
+                    errors=[error_msg],
+                )
+
+            self.logger.info("Starting Roblox remote spy protection transformation")
+
+            self.language_mode = "lua"
+
+            # Apply Lua transformations using custom traversal
+            self._traverse_lua_ast_for_remote_spy(ast_node)
+
+            # Lua transformation is in-place
+            transformed_node = ast_node
+
+            self.logger.info(
+                f"Roblox remote spy protection completed: "
+                f"{self.transformation_count} remote calls protected, "
+                f"{len(self._detected_remotes)} unique remotes"
+            )
+
+            return TransformResult(
+                ast_node=transformed_node,
+                success=True,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+        except Exception as e:
+            error_msg = f"Roblox remote spy protection failed: {e.__class__.__name__}: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.errors.append(error_msg)
+
+            return TransformResult(
+                ast_node=None,
+                success=False,
+                transformation_count=self.transformation_count,
+                errors=self.errors,
+            )
+
+
 class CodeSplittingTransformer(ASTTransformer):
     """Splits function bodies into encrypted chunks that are decrypted and executed at runtime.
 
