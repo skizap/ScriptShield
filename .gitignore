@@ -48,3 +48,6 @@ Thumbs.db
 # Logs
 *.log
 
+# Traycer artifacts
+.traycer/
+
