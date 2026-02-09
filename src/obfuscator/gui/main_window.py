@@ -137,6 +137,7 @@ class MainWindow(QMainWindow):
 
         # Add security configuration widget to left column
         self.security_config = SecurityConfigWidget()
+        self.security_config.set_file_selection_widget(self.file_selection)
         left_layout.addWidget(self.security_config)
 
         left_layout.addStretch()

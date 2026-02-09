@@ -45,8 +45,8 @@ GUI_TO_JSON_FEATURE_MAP = {
     "VM Protection": "vm_protection",
     "Bytecode Compilation": "code_splitting",
     "Index Mangling": "mangle_indexes",
-    "Roblox API Preservation": "roblox_exploit_defense",
-    "Luau Type Stripping": "roblox_remote_spy",
+    "Roblox Exploit Defense": "roblox_exploit_defense",
+    "Roblox Remote Spy Protection": "roblox_remote_spy",
 }
 
 # Valid feature names from JSON schema
@@ -140,6 +140,7 @@ class ObfuscationConfig:
         "preserve_exports": False,
         "preserve_constants": False,
     })
+    runtime_mode: str = "hybrid"
     
     def validate(self) -> None:
         """Validate the configuration.
@@ -165,6 +166,12 @@ class ObfuscationConfig:
                     f"Invalid preset: {self.preset}. "
                     f"Expected one of {VALID_PRESETS} or None"
                 )
+        
+        # Check runtime_mode
+        if self.runtime_mode not in ("hybrid", "embedded"):
+            raise ValueError(
+                f"Invalid runtime_mode: {self.runtime_mode}. Expected 'hybrid' or 'embedded'"
+            )
         
         # Check features
         for feature_name in self.features:
@@ -401,6 +408,7 @@ class ObfuscationConfig:
             "name": self.name,
             "language": self.language,
             "preset": self.preset,
+            "runtime_mode": self.runtime_mode,
             "features": self.features.copy(),
             "options": self.options.copy(),
             "symbol_table_options": self.symbol_table_options.copy(),
@@ -462,6 +470,7 @@ class ObfuscationConfig:
                     "preserve_exports": False,
                     "preserve_constants": False,
                 }),
+                runtime_mode=data.get("runtime_mode", "hybrid"),
             )
             logger.debug(f"Created configuration from dictionary: {config.name}")
             return config
@@ -535,7 +544,8 @@ class ObfuscationConfig:
                 "mangling_strategy": "sequential",
                 "preserve_exports": False,
                 "preserve_constants": False,
-            }
+            },
+            runtime_mode="hybrid",
         )
 
         logger.debug(

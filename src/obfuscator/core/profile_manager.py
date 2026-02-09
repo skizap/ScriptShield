@@ -45,6 +45,7 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "name": "Light Profile",
         "language": "lua",
         "preset": "light",
+        "runtime_mode": "hybrid",
         "features": {
             "mangle_globals": True,
             "string_encryption": False,
@@ -84,6 +85,7 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "name": "Medium Profile",
         "language": "lua",
         "preset": "medium",
+        "runtime_mode": "hybrid",
         "features": {
             "mangle_globals": True,
             "string_encryption": True,
@@ -123,6 +125,7 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "name": "Heavy Profile",
         "language": "lua",
         "preset": "heavy",
+        "runtime_mode": "hybrid",
         "features": {
             "mangle_globals": True,
             "string_encryption": True,
@@ -162,6 +165,7 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "name": "Maximum Profile",
         "language": "lua",
         "preset": "maximum",
+        "runtime_mode": "hybrid",
         "features": {
             "mangle_globals": True,
             "string_encryption": True,

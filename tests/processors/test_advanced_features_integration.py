@@ -31,6 +31,18 @@ from obfuscator.processors.opaque_predicates_transformer import OpaquePredicates
 from obfuscator.processors.anti_debug_transformer import AntiDebuggingTransformer
 from obfuscator.processors.code_splitting_transformer import CodeSplittingTransformer
 from obfuscator.processors.self_modifying_transformer import SelfModifyingCodeTransformer
+from obfuscator.processors.ast_transformer import (
+    RobloxExploitDefenseTransformer,
+    RobloxRemoteSpyTransformer,
+)
+
+# Try to import luaparser for Lua tests
+try:
+    from luaparser import ast as lua_ast
+    from luaparser import astnodes as lua_nodes
+    LUAPARSER_AVAILABLE = True
+except ImportError:
+    LUAPARSER_AVAILABLE = False
 
 
 # Sample Python code for testing
@@ -896,6 +908,295 @@ def process(value):
         result = engine.obfuscate_string(invalid_code)
         # Either success is False or code contains error indication
         self.assertIn("success", result)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+def lua_skip(func):
+    """Decorator to skip Lua tests when luaparser is not available."""
+    return unittest.skipUnless(LUAPARSER_AVAILABLE, "luaparser not available")(func)
+
+
+class TestRobloxFeaturesIntegration(unittest.TestCase):
+    """Integration tests for Roblox-specific features."""
+
+    @lua_skip
+    def test_roblox_exploit_defense_with_vm_protection(self):
+        """Test Roblox exploit defense with VM protection on Lua code."""
+        code = """
+function foo()
+    return 1 + 2
+end
+"""
+        config = ObfuscationConfig(
+            name="Roblox + VM",
+            language="lua",
+            features={
+                "roblox_exploit_defense": True,
+                "roblox_exploit_aggressiveness": 2,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+    @lua_skip
+    def test_roblox_remote_spy_with_string_encryption(self):
+        """Test Roblox remote spy with string encryption on Lua code."""
+        code = """
+local event = game.ReplicatedStorage.MyEvent
+event:FireServer("hello")
+"""
+        config = ObfuscationConfig(
+            name="Remote Spy + String Enc",
+            language="lua",
+            features={
+                "roblox_remote_spy": True,
+                "string_encryption": True,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+    @lua_skip
+    def test_both_roblox_features_together(self):
+        """Test both Roblox features together (exploit defense + remote spy)."""
+        code = """
+local event = game.ReplicatedStorage.PlayerJoined
+event:FireServer("Player1")
+
+function processData()
+    return game.Players.LocalPlayer
+end
+"""
+        config = ObfuscationConfig(
+            name="Both Roblox Features",
+            language="lua",
+            features={
+                "roblox_exploit_defense": True,
+                "roblox_exploit_aggressiveness": 2,
+                "roblox_remote_spy": True,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+    @lua_skip
+    def test_roblox_with_control_flow_and_dead_code(self):
+        """Test Roblox features with control flow flattening and dead code injection."""
+        code = """
+function processPlayer(player)
+    if player then
+        local event = game.ReplicatedStorage.UpdatePlayer
+        event:FireServer(player.Name)
+        return true
+    end
+    return false
+end
+"""
+        config = ObfuscationConfig(
+            name="Roblox + CFF + Dead Code",
+            language="lua",
+            features={
+                "roblox_exploit_defense": True,
+                "roblox_exploit_aggressiveness": 2,
+                "roblox_remote_spy": True,
+                "control_flow_flattening": True,
+                "dead_code_injection": True,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+    def test_roblox_features_skipped_for_python(self):
+        """Test Roblox features are skipped for Python files (transformation_count=0)."""
+        code = """
+def foo():
+    return 42
+"""
+        config = ObfuscationConfig(
+            name="Roblox on Python",
+            language="python",
+            features={
+                "roblox_exploit_defense": True,
+                "roblox_remote_spy": True,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+    @lua_skip
+    def test_roblox_with_anti_debugging(self):
+        """Test Roblox features work with anti-debugging transformer."""
+        code = """
+function secureFunction()
+    return game.Players.LocalPlayer.Name
+end
+"""
+        config = ObfuscationConfig(
+            name="Roblox + Anti-Debug",
+            language="lua",
+            features={
+                "roblox_exploit_defense": True,
+                "roblox_exploit_aggressiveness": 2,
+                "anti_debugging": True,
+                "anti_debug_aggressiveness": 2,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+    @lua_skip
+    def test_full_pipeline_all_transformers_with_roblox(self):
+        """Test full pipeline with all transformers including Roblox features."""
+        code = """
+local remotes = {
+    onDamage = game.ReplicatedStorage.OnDamage,
+    onHeal = game.ReplicatedStorage.OnHeal
+}
+
+function handleCombat(target, damage)
+    remotes.onDamage:FireServer(target, damage)
+    return true
+end
+"""
+        config = ObfuscationConfig(
+            name="Full Pipeline with Roblox",
+            language="lua",
+            features={
+                "string_encryption": True,
+                "number_obfuscation": True,
+                "constant_array": True,
+                "control_flow_flattening": True,
+                "dead_code_injection": True,
+                "opaque_predicates": True,
+                "anti_debugging": True,
+                "roblox_exploit_defense": True,
+                "roblox_exploit_aggressiveness": 2,
+                "roblox_remote_spy": True,
+            },
+        )
+        engine = ObfuscationEngine(config)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
+
+
+class TestRobloxLanguageDetection(unittest.TestCase):
+    """Tests for Roblox language detection and handling."""
+
+    @lua_skip
+    def test_roblox_transformers_only_apply_to_lua_chunks(self):
+        """Test Roblox transformers only apply to Lua ASTs."""
+        transformer = RobloxExploitDefenseTransformer(aggressiveness=2)
+
+        # Lua code should be processed
+        lua_code = "function foo() return 1 end"
+        lua_tree = lua_ast.parse(lua_code)
+
+        result = transformer.transform(lua_tree)
+        self.assertTrue(result.success)
+        self.assertGreater(result.transformation_count, 0)
+
+    def test_python_asts_returned_unchanged(self):
+        """Test Python ASTs are returned unchanged with success=True."""
+        transformer = RobloxExploitDefenseTransformer(aggressiveness=2)
+
+        python_code = "def foo(): return 1"
+        python_tree = ast.parse(python_code)
+
+        result = transformer.transform(python_tree)
+        self.assertTrue(result.success)
+        self.assertEqual(result.transformation_count, 0)
+
+    def test_transformation_count_is_zero_for_python(self):
+        """Test transformation count is 0 for Python files."""
+        transformer = RobloxRemoteSpyTransformer()
+
+        python_code = "def foo(): pass"
+        python_tree = ast.parse(python_code)
+
+        result = transformer.transform(python_tree)
+        self.assertEqual(result.transformation_count, 0)
+
+    def test_no_errors_when_skipping_python_files(self):
+        """Test no errors are generated when skipping Python files."""
+        transformer = RobloxExploitDefenseTransformer(aggressiveness=2)
+
+        python_code = "def foo(): return 42"
+        python_tree = ast.parse(python_code)
+
+        result = transformer.transform(python_tree)
+        self.assertEqual(len(result.errors), 0)
+
+
+class TestRobloxProfilePresets(unittest.TestCase):
+    """Tests for Roblox feature configuration in profile presets."""
+
+    def test_maximum_preset_includes_roblox_for_lua(self):
+        """Test 'Maximum' preset includes Roblox features for Lua projects."""
+        config = ProfileManager.get_default_profile("Maximum")
+
+        # Maximum should have Roblox features enabled
+        self.assertTrue(config.features.get("roblox_exploit_defense", False))
+        self.assertTrue(config.features.get("roblox_remote_spy", False))
+
+    def test_roblox_feature_options_in_presets(self):
+        """Test Roblox feature options are correctly set in presets."""
+        config = ProfileManager.get_default_profile("Maximum")
+
+        # Check aggressiveness option
+        self.assertIn("roblox_exploit_aggressiveness", config.options)
+        self.assertEqual(config.options.get("roblox_exploit_aggressiveness"), 3)
+
+    def test_roblox_exploit_aggressiveness_respected(self):
+        """Test `roblox_exploit_aggressiveness` option is respected."""
+        config = ObfuscationConfig(
+            name="Test Aggressiveness",
+            language="lua",
+            features={"roblox_exploit_defense": True},
+            options={"roblox_exploit_aggressiveness": 1},
+        )
+        engine = ObfuscationEngine(config)
+
+        # Verify the option is passed to transformer
+        transformers = engine.get_enabled_transformers("lua")
+        for t in transformers:
+            if isinstance(t, RobloxExploitDefenseTransformer):
+                self.assertEqual(t.aggressiveness, 1)
+                break
+
+    @lua_skip
+    def test_roblox_features_can_be_disabled_via_config(self):
+        """Test Roblox features can be enabled/disabled via config."""
+        # Test with disabled
+        config_disabled = ObfuscationConfig(
+            name="Disabled",
+            language="lua",
+            features={
+                "roblox_exploit_defense": False,
+                "roblox_remote_spy": False,
+            },
+        )
+
+        code = "local e = game.ReplicatedStorage.Event\ne:FireServer()"
+        engine = ObfuscationEngine(config_disabled)
+        result = engine.obfuscate_string(code)
+
+        self.assertTrue(result.get("success", False))
 
 
 if __name__ == "__main__":

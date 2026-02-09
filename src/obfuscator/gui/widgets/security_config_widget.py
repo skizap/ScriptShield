@@ -17,8 +17,13 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QCursor
 
+from typing import TYPE_CHECKING
+
 from obfuscator.utils.logger import get_logger
 from obfuscator.gui.styles.stylesheet import get_widget_style, COLORS
+
+if TYPE_CHECKING:
+    from obfuscator.gui.widgets.file_selection_widget import FileSelectionWidget
 
 logger = get_logger("obfuscator.gui.widgets.security_config_widget")
 
@@ -36,8 +41,8 @@ FEATURE_TOOLTIPS = {
     "Anti-Debug": "Adds debugger detection checks",
     "VM Protection": "Wraps code in virtual machine layer",
     "Bytecode Compilation": "Compiles to bytecode format",
-    "Roblox API Preservation": "Preserves Roblox-specific APIs",
-    "Luau Type Stripping": "Removes Luau type annotations",
+    "Roblox Exploit Defense": "Detects and blocks Roblox exploit executors (Synapse, KRNL, Script-Ware) with integrity checks and environment fingerprinting",
+    "Roblox Remote Spy Protection": "Encrypts RemoteEvent/RemoteFunction names and obfuscates argument patterns to prevent remote spy tools",
 }
 
 # Preset tooltips
@@ -68,8 +73,8 @@ ADVANCED_FEATURES = [
 ]
 
 ROBLOX_FEATURES = [
-    "Roblox API Preservation",
-    "Luau Type Stripping",
+    "Roblox Exploit Defense",
+    "Roblox Remote Spy Protection",
 ]
 
 # Preset configurations mapping preset names to enabled features
@@ -98,7 +103,24 @@ PRESET_CONFIGS = {
 
 
 class SecurityConfigWidget(QWidget):
-    """Widget for configuring security/obfuscation settings."""
+    """Widget for configuring security/obfuscation settings.
+
+    This widget provides preset security levels and advanced feature toggles
+    for configuring obfuscation settings. It supports language-aware feature
+    visibility - Roblox-specific features are only shown for Lua/Luau projects.
+
+    Language Detection:
+        The widget connects to the FileSelectionWidget to monitor file changes
+        and automatically show/hide Roblox-specific features based on the
+        detected project language. Roblox features are shown for Lua, Luau,
+        and Mixed language projects, but hidden for Python-only projects.
+
+    Features:
+        - Preset security levels (Light, Medium, Heavy, Maximum)
+        - Advanced feature toggles with "Lua Only" badges for Roblox features
+        - Dynamic language-aware visibility for language-specific features
+        - Profile save/load compatibility with language filtering
+    """
 
     config_changed = pyqtSignal(dict)
 
@@ -109,6 +131,9 @@ class SecurityConfigWidget(QWidget):
         self._advanced_expanded: bool = False
         self._preset_buttons: dict[str, QPushButton] = {}
         self._feature_checkboxes: dict[str, QCheckBox] = {}
+        self._current_language: str = "Lua"  # Track current project language
+        self._file_selection_widget: "FileSelectionWidget | None" = None  # Reference to file selection widget
+        self._roblox_section_widgets: list[QWidget] = []  # Track Roblox section widgets for visibility
 
         self._init_features()
         self._setup_ui()
@@ -121,6 +146,92 @@ class SecurityConfigWidget(QWidget):
         all_features = CORE_FEATURES + ADVANCED_FEATURES + ROBLOX_FEATURES
         for feature in all_features:
             self._features[feature] = False
+
+    def set_file_selection_widget(self, file_selection_widget: "FileSelectionWidget") -> None:
+        """Connect to file selection widget for language detection.
+
+        This method establishes a connection between the security configuration
+        widget and the file selection widget. It allows the security widget to
+        monitor file selection changes and automatically show/hide Roblox-specific
+        features based on the detected project language.
+
+        The language detection flow:
+        1. User adds/removes files in FileSelectionWidget
+        2. FileSelectionWidget emits files_changed signal
+        3. _on_files_changed handler detects project language
+        4. _update_language_visibility shows/hides Roblox features accordingly
+
+        Args:
+            file_selection_widget: The FileSelectionWidget instance to connect to.
+
+        Note:
+            This should be called during widget initialization, after both
+            widgets are created but before the main window is shown.
+        """
+        self._file_selection_widget = file_selection_widget
+        self._file_selection_widget.files_changed.connect(self._on_files_changed)
+        self._update_language_visibility()
+        logger.debug("Connected to FileSelectionWidget for language detection")
+
+    def _on_files_changed(self, files: list) -> None:
+        """Handle file selection changes to update language-specific features.
+
+        Args:
+            files: List of file paths (not used directly, we get languages from widget).
+        """
+        if not self._file_selection_widget:
+            return
+
+        # Get files with languages from file selection widget
+        files_with_languages = self._file_selection_widget.get_files_with_languages()
+
+        # Detect project language using file selection widget's method
+        detected_language = self._file_selection_widget._detect_project_language()
+        self._current_language = detected_language
+
+        # Check if any Python files are present (for mixed projects, treat as Python-only)
+        languages = set(files_with_languages.values()) if files_with_languages else set()
+        self._python_present = "Python" in languages
+
+        logger.debug(f"Language detected: {detected_language}, Python present: {self._python_present} from {len(files_with_languages)} files")
+        self._update_language_visibility()
+
+    def _update_language_visibility(self) -> None:
+        """Show/hide Roblox features based on current language.
+
+        Shows Roblox features section only when no Python files are present.
+        Hides Roblox features section when Python files are part of the selection,
+        even if Lua/Luau files are also present (mixed projects).
+        Also disables Roblox feature checkboxes when hidden.
+
+        Handles edge cases:
+        - Mixed projects (Python + Lua/Luau): Hide Roblox features
+        - Empty file selection: Default to showing Roblox features (assume Lua)
+        - Rapid file selection changes: Handled by Qt's signal system
+        """
+        # Determine if Roblox features should be shown
+        # Hide when Python files are present (treat mixed as Python-only for feature visibility)
+        # Show only when no Python files and we have Lua/Luau files (or empty/default)
+        should_show_roblox = not getattr(self, '_python_present', False) and self._current_language in ("Lua", "Luau", "Mixed")
+
+        # Show/hide all Roblox section widgets
+        for widget in self._roblox_section_widgets:
+            widget.setVisible(should_show_roblox)
+
+        # Disable Roblox feature checkboxes when hidden
+        for feature in ROBLOX_FEATURES:
+            if feature in self._feature_checkboxes:
+                checkbox = self._feature_checkboxes[feature]
+                checkbox.setEnabled(should_show_roblox)
+                if not should_show_roblox:
+                    # Uncheck Roblox features when hidden
+                    checkbox.setChecked(False)
+                    self._features[feature] = False
+
+        if should_show_roblox:
+            logger.debug("Roblox features visible (no Python files in selection)")
+        else:
+            logger.debug("Roblox features hidden (Python files present in selection)")
 
     def _setup_ui(self) -> None:
         """Set up the widget UI components."""
@@ -196,12 +307,28 @@ class SecurityConfigWidget(QWidget):
     def _add_feature_section(
         self, parent_layout: QVBoxLayout, section_title: str, features: list[str]
     ) -> None:
-        """Add a section of feature checkboxes to the panel."""
+        """Add a section of feature checkboxes to the panel.
+
+        For Roblox-Specific Features section, adds "Lua Only" badges next to
+        each feature checkbox to indicate these features only apply to Lua/Luau files.
+        Also tracks all Roblox section widgets for language-based visibility toggling.
+        """
+        is_roblox_section = section_title == "Roblox-Specific Features"
+
         section_label = QLabel(section_title)
         section_label.setStyleSheet(get_widget_style("section_label"))
         parent_layout.addWidget(section_label)
 
+        # Track Roblox section label for visibility toggling
+        if is_roblox_section:
+            self._roblox_section_widgets.append(section_label)
+
         for feature in features:
+            # Create horizontal layout for checkbox and optional badge
+            feature_layout = QHBoxLayout()
+            feature_layout.setSpacing(8)
+            feature_layout.setContentsMargins(0, 0, 0, 0)
+
             checkbox = QCheckBox(feature)
             slug = feature.lower().replace(" ", "-")
             checkbox.setProperty("data-element-id", f"feature-checkbox-{slug}")
@@ -211,12 +338,41 @@ class SecurityConfigWidget(QWidget):
                 lambda state, f=feature: self._on_feature_toggled(f, state == 2)
             )
             self._feature_checkboxes[feature] = checkbox
-            parent_layout.addWidget(checkbox)
+            feature_layout.addWidget(checkbox)
+
+            # Add "Lua Only" badge for Roblox features
+            if is_roblox_section:
+                badge = QLabel("Lua Only")
+                badge.setStyleSheet(
+                    f"font-size: 10px; padding: 2px 6px; border-radius: 3px; "
+                    f"background-color: {COLORS.get('accent', '#2196F3')}; "
+                    f"color: white;"
+                )
+                badge.setToolTip("This feature only applies to Lua and Luau files")
+                feature_layout.addWidget(badge)
+                feature_layout.addStretch()
+
+                # Create container widget to track for visibility
+                feature_container = QWidget()
+                feature_container.setLayout(feature_layout)
+                self._roblox_section_widgets.append(feature_container)
+                parent_layout.addWidget(feature_container)
+            else:
+                feature_layout.addStretch()
+                feature_container = QWidget()
+                feature_container.setLayout(feature_layout)
+                parent_layout.addWidget(feature_container)
 
     def _on_preset_clicked(self, preset_name: str) -> None:
         """Handle preset button click."""
         self._current_preset = preset_name
         enabled_features = PRESET_CONFIGS.get(preset_name, [])
+
+        # Filter out Roblox features if Python files are present
+        # This applies to both Python-only and mixed (Python+Lua/Luau) projects
+        if getattr(self, '_python_present', False) or self._current_language == "Python":
+            enabled_features = [f for f in enabled_features if f not in ROBLOX_FEATURES]
+            logger.debug(f"Filtered out Roblox features (Python present) in {preset_name} preset")
 
         # Update internal features state
         for feature in self._features:
@@ -290,7 +446,12 @@ class SecurityConfigWidget(QWidget):
         }
 
     def set_config(self, preset: str = None, features: dict = None) -> None:
-        """Set configuration programmatically."""
+        """Set configuration programmatically.
+
+        When loading a profile with Roblox features enabled but Python files are
+        present (including mixed projects), a warning is logged and Roblox features
+        are auto-disabled.
+        """
         if preset is not None and preset in PRESET_CONFIGS:
             self._on_preset_clicked(preset)
         elif features is not None:
@@ -298,6 +459,20 @@ class SecurityConfigWidget(QWidget):
             # This ensures missing features default to unchecked
             for feature in self._features:
                 self._features[feature] = False
+
+            # Check for language mismatch with Roblox features
+            # Auto-disable if Python files are present (Python-only or mixed projects)
+            roblox_enabled = any(features.get(f, False) for f in ROBLOX_FEATURES)
+            python_present = getattr(self, '_python_present', False) or self._current_language == "Python"
+            if roblox_enabled and python_present:
+                logger.warning(
+                    "Roblox features enabled in profile but Python files are present. "
+                    "Roblox features will be auto-disabled."
+                )
+                # Auto-disable Roblox features when Python is present
+                for roblox_feature in ROBLOX_FEATURES:
+                    if roblox_feature in features:
+                        features[roblox_feature] = False
 
             self._features.update(features)
             self._current_preset = self._find_matching_preset()
