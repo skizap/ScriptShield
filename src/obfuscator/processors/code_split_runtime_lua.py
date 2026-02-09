@@ -74,6 +74,12 @@ local function _reassemble_function(chunks, ...)
     end
     return func(...)
 end
+
+-- Return the module with exported functions
+return {{
+    _decrypt_chunk = _decrypt_chunk,
+    _reassemble_function = _reassemble_function,
+}}
 '''
     else:
         runtime = '''
@@ -96,5 +102,11 @@ local function _reassemble_function(chunks, ...)
     end
     return func(...)
 end
+
+-- Return the module with exported functions
+return {{
+    _decrypt_chunk = _decrypt_chunk,
+    _reassemble_function = _reassemble_function,
+}}
 '''
     return runtime.strip()

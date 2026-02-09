@@ -149,7 +149,14 @@ end'''
         end
         return nil
     end
-end'''
+end
+
+return {
+    _redefine_function = _redefine_function,
+    _generate_code_at_runtime = _generate_code_at_runtime,
+    _modify_function_body = _modify_function_body,
+    _self_modify_wrapper = _self_modify_wrapper,
+}'''
     code_parts.append(wrapper_func)
 
     return "\n\n".join(code_parts)

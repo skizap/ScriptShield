@@ -148,6 +148,13 @@ end"""
 end"""
 
     code_parts.append(main_check)
+    code_parts.append("")
+
+    # Return the module with exported functions
+    code_parts.append("return {")
+    code_parts.append(f"    {check_func_name} = {check_func_name},")
+    code_parts.append(f"    {defensive_action_name} = {defensive_action_name},")
+    code_parts.append("}")
 
     return "\n\n".join(code_parts)
 

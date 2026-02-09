@@ -134,10 +134,11 @@ class ProfileWidget(QWidget):
 
         try:
             # Convert config dict to ObfuscationConfig
-            # Extract security_config containing preset and features
+            # Extract security_config containing preset, features, and runtime_mode
             security_config = config.get("security_config", {})
             preset = security_config.get("preset")  # Don't default to "medium"
             features = security_config.get("features", {})
+            runtime_mode = security_config.get("runtime_mode", "hybrid")
 
             # Extract language and options from config
             language = config.get("language", "lua")
@@ -156,6 +157,9 @@ class ProfileWidget(QWidget):
                 features=features,
                 language=language
             )
+
+            # Set runtime_mode from GUI config
+            config_obj.runtime_mode = runtime_mode
 
             # Set options from GUI values
             config_obj.options = options
@@ -238,12 +242,16 @@ class ProfileWidget(QWidget):
                 if gui_name:
                     gui_features[gui_name] = enabled
 
+            # Get runtime_mode from config_obj or profile_data
+            runtime_mode = getattr(config_obj, 'runtime_mode', None) or profile_data.get('runtime_mode', 'hybrid')
+
             # Transform to match current GUI format
             # Include security_config, output_path, and files
             gui_config = {
                 "security_config": {
                     "preset": preset_gui,
-                    "features": gui_features
+                    "features": gui_features,
+                    "runtime_mode": runtime_mode,
                 }
             }
 

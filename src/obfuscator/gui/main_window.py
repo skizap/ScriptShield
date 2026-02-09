@@ -384,6 +384,7 @@ class MainWindow(QMainWindow):
         # Validate preset and features
         preset = security_config.get("preset")
         features = security_config.get("features")
+        runtime_mode = security_config.get("runtime_mode")
 
         if preset is None and not features:
             logger.error("Profile loaded but both preset and features are missing")
@@ -396,8 +397,8 @@ class MainWindow(QMainWindow):
 
         # Apply security configuration to widget
         try:
-            self.security_config.set_config(preset=preset, features=features)
-            logger.info(f"Profile loaded successfully - Preset: {preset}, Features: {len(features) if features else 0}")
+            self.security_config.set_config(preset=preset, features=features, runtime_mode=runtime_mode)
+            logger.info(f"Profile loaded successfully - Preset: {preset}, Features: {len(features) if features else 0}, Runtime Mode: {runtime_mode}")
         except Exception as e:
             logger.error(f"Failed to apply security configuration: {e}")
             QMessageBox.critical(

@@ -184,6 +184,17 @@ STYLES = {
             height: 16px;
         }}
     """,
+    "radio_button": f"""
+        QRadioButton {{
+            color: white;
+            spacing: 8px;
+            font-size: {FONTS['size_body']};
+        }}
+        QRadioButton::indicator {{
+            width: 16px;
+            height: 16px;
+        }}
+    """,
     "advanced_toggle": f"""
         QPushButton {{
             background-color: {COLORS['bg_light']};

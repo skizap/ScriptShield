@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QCheckBox,
     QFrame,
+    QRadioButton,
+    QButtonGroup,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QCursor
@@ -134,6 +136,12 @@ class SecurityConfigWidget(QWidget):
         self._current_language: str = "Lua"  # Track current project language
         self._file_selection_widget: "FileSelectionWidget | None" = None  # Reference to file selection widget
         self._roblox_section_widgets: list[QWidget] = []  # Track Roblox section widgets for visibility
+        
+        # Runtime mode tracking
+        self._runtime_mode: str = "hybrid"
+        self._runtime_button_group: QButtonGroup = None
+        self._hybrid_radio: QRadioButton = None
+        self._embedded_radio: QRadioButton = None
 
         self._init_features()
         self._setup_ui()
@@ -248,6 +256,9 @@ class SecurityConfigWidget(QWidget):
         # Preset buttons section
         self._setup_preset_buttons(main_layout)
 
+        # Runtime mode section
+        self._setup_runtime_mode_section(main_layout)
+
         # Advanced options toggle
         self._setup_advanced_toggle(main_layout)
 
@@ -272,6 +283,63 @@ class SecurityConfigWidget(QWidget):
             presets_layout.addWidget(btn)
 
         parent_layout.addWidget(presets_container)
+
+    def _setup_runtime_mode_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create the runtime mode selection section with radio buttons."""
+        # Section label
+        section_label = QLabel("Runtime Mode")
+        section_label.setStyleSheet(get_widget_style("section_label"))
+        parent_layout.addWidget(section_label)
+
+        # Create button group for mutual exclusivity
+        self._runtime_button_group = QButtonGroup(self)
+
+        # Create horizontal layout for radio buttons
+        radio_layout = QHBoxLayout()
+        radio_layout.setSpacing(16)
+        radio_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Hybrid radio button
+        self._hybrid_radio = QRadioButton("Hybrid")
+        self._hybrid_radio.setProperty("data-element-id", "runtime-mode-hybrid-radio")
+        self._hybrid_radio.setToolTip(
+            "Shared runtime files across project. Smaller output size, requires runtime files to be distributed with obfuscated code."
+        )
+        self._hybrid_radio.setStyleSheet(get_widget_style("checkbox"))
+        self._hybrid_radio.setChecked(True)
+        self._runtime_button_group.addButton(self._hybrid_radio)
+        radio_layout.addWidget(self._hybrid_radio)
+
+        # Embedded radio button
+        self._embedded_radio = QRadioButton("Embedded")
+        self._embedded_radio.setProperty("data-element-id", "runtime-mode-embedded-radio")
+        self._embedded_radio.setToolTip(
+            "Runtime code embedded in each file. Larger output size, fully self-contained files."
+        )
+        self._embedded_radio.setStyleSheet(get_widget_style("checkbox"))
+        self._runtime_button_group.addButton(self._embedded_radio)
+        radio_layout.addWidget(self._embedded_radio)
+
+        radio_layout.addStretch()
+
+        # Create container widget
+        radio_container = QWidget()
+        radio_container.setLayout(radio_layout)
+        parent_layout.addWidget(radio_container)
+
+        # Connect signals
+        self._hybrid_radio.toggled.connect(self._on_runtime_mode_changed)
+        self._embedded_radio.toggled.connect(self._on_runtime_mode_changed)
+
+    def _on_runtime_mode_changed(self) -> None:
+        """Handle runtime mode radio button toggle."""
+        if self._hybrid_radio.isChecked():
+            self._runtime_mode = "hybrid"
+        else:
+            self._runtime_mode = "embedded"
+        
+        self._emit_config_changed()
+        logger.debug(f"Runtime mode changed to: {self._runtime_mode}")
 
     def _setup_advanced_toggle(self, parent_layout: QVBoxLayout) -> None:
         """Create the advanced options toggle button."""
@@ -443,15 +511,40 @@ class SecurityConfigWidget(QWidget):
         return {
             "preset": self._current_preset,
             "features": dict(self._features),
+            "runtime_mode": self._runtime_mode,
         }
 
-    def set_config(self, preset: str = None, features: dict = None) -> None:
+    def set_config(
+        self, preset: str = None, features: dict = None, runtime_mode: str = None
+    ) -> None:
         """Set configuration programmatically.
 
         When loading a profile with Roblox features enabled but Python files are
         present (including mixed projects), a warning is logged and Roblox features
         are auto-disabled.
         """
+        # Handle runtime_mode first to avoid triggering change events during preset application
+        if runtime_mode is not None and runtime_mode in ("hybrid", "embedded"):
+            self._runtime_mode = runtime_mode
+            # Update radio buttons without triggering signals
+            self._hybrid_radio.blockSignals(True)
+            self._embedded_radio.blockSignals(True)
+            self._hybrid_radio.setChecked(runtime_mode == "hybrid")
+            self._embedded_radio.setChecked(runtime_mode == "embedded")
+            self._hybrid_radio.blockSignals(False)
+            self._embedded_radio.blockSignals(False)
+            logger.debug(f"Runtime mode set to: {runtime_mode}")
+        elif runtime_mode is not None:
+            # Invalid runtime_mode value
+            logger.warning(f"Invalid runtime_mode '{runtime_mode}', defaulting to 'hybrid'")
+            self._runtime_mode = "hybrid"
+            self._hybrid_radio.blockSignals(True)
+            self._embedded_radio.blockSignals(True)
+            self._hybrid_radio.setChecked(True)
+            self._embedded_radio.setChecked(False)
+            self._hybrid_radio.blockSignals(False)
+            self._embedded_radio.blockSignals(False)
+
         if preset is not None and preset in PRESET_CONFIGS:
             self._on_preset_clicked(preset)
         elif features is not None:
@@ -483,3 +576,12 @@ class SecurityConfigWidget(QWidget):
     def reset(self) -> None:
         """Reset to default configuration (Light preset)."""
         self._on_preset_clicked("Light")
+        # Reset runtime mode to hybrid
+        self._runtime_mode = "hybrid"
+        self._hybrid_radio.blockSignals(True)
+        self._embedded_radio.blockSignals(True)
+        self._hybrid_radio.setChecked(True)
+        self._embedded_radio.setChecked(False)
+        self._hybrid_radio.blockSignals(False)
+        self._embedded_radio.blockSignals(False)
+        logger.debug("Runtime mode reset to: hybrid")

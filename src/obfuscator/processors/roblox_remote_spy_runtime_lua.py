@@ -171,5 +171,14 @@ end'''
     expose_code = f'''_G["_resolve_remote_0x6a5f"] = {resolve_remote}
 _G["_decrypt_remote_name_0x7b8c"] = {decrypt_name}'''
     code_parts.append(expose_code)
+    code_parts.append("")
+
+    # Return the module with exported functions
+    code_parts.append("return {")
+    code_parts.append(f"    {decrypt_name} = {decrypt_name},")
+    code_parts.append(f"    {resolve_remote} = {resolve_remote},")
+    code_parts.append(f"    {names_table} = {names_table},")
+    code_parts.append(f"    {cache_table} = {cache_table},")
+    code_parts.append("}")
 
     return "\n\n".join(code_parts)
