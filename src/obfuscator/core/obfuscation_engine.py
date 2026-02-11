@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from obfuscator.core.config import ObfuscationConfig
+from obfuscator.core.runtime_manager import RuntimeManager
 from obfuscator.processors.ast_transformer import (
     AntiDebuggingTransformer,
     ASTTransformer,
@@ -74,6 +75,8 @@ class ObfuscationEngine:
 
     Attributes:
         config: The ObfuscationConfig controlling which features are enabled.
+        runtime_manager: The RuntimeManager instance for runtime code generation.
+        required_runtimes: Set of feature names that require runtime code.
 
     Example:
         >>> engine = ObfuscationEngine(config)
@@ -83,7 +86,15 @@ class ObfuscationEngine:
         ...     print(f"Applied {result.transformation_count} transformations")
     """
 
-    # Ordered mapping of feature flag → transformer class.
+    # Set of feature flags that require runtime code generation
+    _RUNTIME_REQUIRING_FEATURES: set[str] = {
+        "vm_protection",
+        "code_splitting",
+        "self_modifying_code",
+        "anti_debugging",
+        "roblox_exploit_defense",
+        "roblox_remote_spy",
+    }
     # The order defines the transformation pipeline sequence.
     _TRANSFORMER_ORDER: list[tuple[str, type[ASTTransformer]]] = [
         ("string_encryption", StringEncryptionTransformer),
@@ -108,6 +119,8 @@ class ObfuscationEngine:
             config: ObfuscationConfig instance with feature flags and options.
         """
         self.config = config
+        self.runtime_manager = RuntimeManager(config)
+        self.required_runtimes: set[str] = set()
         logger.debug(
             f"ObfuscationEngine initialized with config '{config.name}', "
             f"features: {config.features}"
@@ -140,9 +153,9 @@ class ObfuscationEngine:
             if not self.config.features.get(feature_flag, False):
                 continue
 
-            # Instantiate the transformer with config
+            # Instantiate the transformer with config and runtime_manager
             try:
-                transformer = transformer_cls(config=self.config)
+                transformer = transformer_cls(config=self.config, runtime_manager=self.runtime_manager)
             except Exception as e:
                 logger.warning(
                     f"Failed to instantiate {transformer_cls.__name__}: {e}"
@@ -195,6 +208,9 @@ class ObfuscationEngine:
             TransformResult with the final AST, success status, cumulative
             transformation count, and any errors.
         """
+        # Reset runtime tracking at the start of each transformation pipeline
+        self.required_runtimes = set()
+
         transformers = self.get_enabled_transformers(language)
 
         # No transformers enabled → success with original AST
@@ -242,6 +258,19 @@ class ObfuscationEngine:
 
             current_ast = result.ast_node
             total_count += result.transformation_count
+
+            # Check if this transformer requires runtime code
+            # Map transformer class name to feature flag
+            transformer_feature = None
+            for feature_flag, transformer_cls in self._TRANSFORMER_ORDER:
+                if isinstance(transformer, transformer_cls):
+                    transformer_feature = feature_flag
+                    break
+
+            if transformer_feature and transformer_feature in self._RUNTIME_REQUIRING_FEATURES:
+                self.required_runtimes.add(transformer_feature)
+                logger.debug(f"Feature '{transformer_feature}' requires runtime code")
+
             logger.debug(
                 f"{name} completed: {result.transformation_count} nodes transformed"
             )
@@ -342,8 +371,14 @@ class ObfuscationEngine:
                 "errors": result.errors,
             }
 
+        # For Python, embed runtime in AST before generating code (consistent with processor)
+        final_ast = result.ast_node
+        if target_language == "python" and self.config.runtime_mode == "embedded" and self.has_runtime_requirements():
+            final_ast = self.embed_runtime_in_ast(result.ast_node, target_language)
+            logger.debug("Embedded runtime code into Python AST before code generation")
+
         # Generate code from transformed AST
-        gen_result = processor.generate_code(result.ast_node)
+        gen_result = processor.generate_code(final_ast)
 
         if not gen_result.success:
             return {
@@ -353,11 +388,170 @@ class ObfuscationEngine:
                 "errors": gen_result.errors,
             }
 
+        # For Lua or fallback, inject embedded runtime code at string level if needed
+        final_code = gen_result.code
+        if target_language == "lua" and self.config.runtime_mode == "embedded" and self.has_runtime_requirements():
+            runtime_code = self.prepare_embedded_runtime(target_language)
+            if runtime_code:
+                final_code = runtime_code + final_code
+                logger.info(f"Embedded runtime code injected ({len(runtime_code)} chars)")
+
         return {
             "success": True,
-            "code": gen_result.code,
+            "code": final_code,
             "stats": {
                 "transformation_count": result.transformation_count,
             },
             "errors": [],
         }
+
+    def has_runtime_requirements(self) -> bool:
+        """Check if any runtime-requiring features were applied.
+
+        Returns:
+            True if runtime code is required, False otherwise.
+        """
+        return len(self.required_runtimes) > 0
+
+    def get_required_runtime_code(self, language: str) -> str:
+        """Get combined runtime code for all required features.
+
+        Checks if the config is in embedded mode and if runtime
+        requirements exist, then generates combined runtime code
+        ONLY for the features that were actually applied during transformations
+        (tracked in required_runtimes), not all enabled features.
+
+        Args:
+            language: Target language ("python" or "lua").
+
+        Returns:
+            Combined runtime code string, or empty string if no runtime needed.
+        """
+        if self.config.runtime_mode != "embedded":
+            return ""
+
+        if not self.required_runtimes:
+            return ""
+
+        try:
+            # Generate runtime code ONLY for features that were actually applied
+            parts: list[str] = []
+
+            # Add header comment
+            if language == "python":
+                parts.append('# Obfuscation Runtime Code - Applied Features')
+                parts.append('# Generated by ScriptShield RuntimeManager')
+                parts.append('')
+            else:  # lua
+                parts.append('-- Obfuscation Runtime Code - Applied Features')
+                parts.append('-- Generated by ScriptShield RuntimeManager')
+                parts.append('')
+
+            # Generate runtime code only for required features (those actually applied)
+            for i, runtime_type in enumerate(self.required_runtimes):
+                code = self.runtime_manager.generate_runtime_code(runtime_type, language)
+                if code:
+                    if i > 0:
+                        # Add separator between runtimes
+                        if language == "python":
+                            parts.append(f'\n# {"=" * 60}')
+                            parts.append(f'# Runtime: {runtime_type}')
+                            parts.append(f'# {"=" * 60}\n')
+                        else:  # lua
+                            parts.append(f'\n-- {"=" * 60}')
+                            parts.append(f'-- Runtime: {runtime_type}')
+                            parts.append(f'-- {"=" * 60}\n')
+                    parts.append(code)
+                    logger.debug(f"Generated runtime code for {runtime_type} ({language})")
+
+            combined_code = '\n'.join(parts)
+            logger.info(
+                f"Generated runtime code for {len(self.required_runtimes)} applied features "
+                f"({len(combined_code)} chars)"
+            )
+            return combined_code
+
+        except Exception as e:
+            logger.warning(f"Failed to generate runtime code: {e}")
+            return ""
+
+    def embed_runtime_in_ast(self, ast_node: Any, language: str) -> Any:
+        """Embed runtime code at the top of an AST.
+
+        Generates runtime code for applied features and prepends it as
+        executable AST statements (Python) or returns AST unchanged (Lua)
+        for string-level injection.
+
+        Args:
+            ast_node: The AST node to embed runtime into (ast.Module or lua Chunk).
+            language: Target language ("python" or "lua").
+
+        Returns:
+            AST node with embedded runtime code, or original AST if no runtime needed.
+        """
+        if self.config.runtime_mode != "embedded":
+            return ast_node
+
+        if not self.required_runtimes:
+            return ast_node
+
+        try:
+            runtime_code = self.get_required_runtime_code(language)
+            if not runtime_code:
+                return ast_node
+
+            if language == "python" and isinstance(ast_node, ast.Module):
+                # Parse runtime code into executable AST statements
+                try:
+                    runtime_ast = ast.parse(runtime_code)
+                    if isinstance(runtime_ast, ast.Module) and runtime_ast.body:
+                        # Insert runtime statements at the beginning of the module body
+                        new_body = list(runtime_ast.body) + list(ast_node.body)
+                        ast_node.body = new_body
+                        logger.debug(f"Embedded runtime code into Python AST as executable statements ({len(runtime_code)} chars)")
+                    else:
+                        logger.warning("Parsed runtime code did not produce valid module body")
+                except SyntaxError as e:
+                    logger.warning(f"Failed to parse runtime code into AST: {e}")
+                    return ast_node
+
+            elif language == "lua":
+                # For Lua, we can't easily modify the AST to add runtime code
+                # So we return the AST unchanged - runtime will be prepended at code generation
+                logger.debug("Lua runtime code will be prepended at code generation time")
+                return ast_node
+
+            return ast_node
+
+        except Exception as e:
+            logger.warning(f"Failed to embed runtime in AST: {e}")
+            return ast_node
+
+    def prepare_embedded_runtime(self, language: str) -> str:
+        """Prepare runtime code for embedding into obfuscated files.
+
+        Formats the runtime code with language-specific headers and separators
+        for clear separation from the obfuscated code.
+
+        Args:
+            language: Target language ("python" or "lua").
+
+        Returns:
+            Formatted runtime code block with headers, or empty string if none.
+        """
+        runtime_code = self.get_required_runtime_code(language)
+
+        if not runtime_code:
+            return ""
+
+        if language == "python":
+            header = "# ============ EMBEDDED RUNTIME CODE ============\n"
+            footer = "\n# ============ END RUNTIME CODE ============\n\n"
+        elif language == "lua":
+            header = "-- ============ EMBEDDED RUNTIME CODE ============\n"
+            footer = "\n-- ============ END RUNTIME CODE ============\n\n"
+        else:
+            # Fallback for unsupported languages
+            return runtime_code + "\n\n"
+
+        return header + runtime_code + footer

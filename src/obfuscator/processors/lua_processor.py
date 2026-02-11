@@ -41,6 +41,7 @@ from obfuscator.utils.logger import get_logger
 if TYPE_CHECKING:
     from obfuscator.core.config import ObfuscationConfig
     from obfuscator.core.symbol_table import GlobalSymbolTable
+from obfuscator.core.obfuscation_engine import ObfuscationEngine
 from obfuscator.processors.luau_extensions import (
     LuauCodeGenerator,
     LuaJITDetector,
@@ -178,6 +179,7 @@ class LuaProcessor:
         self.enable_luau = enable_luau
         self.debug_mode = debug_mode
         self._config = config
+        self._current_engine: ObfuscationEngine | None = None
         self._luau_preprocessor: Optional[LuauPreprocessor] = None
         self._luau_generator: Optional[LuauCodeGenerator] = None
         self._luajit_detector: Optional[LuaJITDetector] = None
@@ -377,6 +379,7 @@ class LuaProcessor:
         self,
         ast_node: luaparser.astnodes.Node,
         restore_luau_types: bool = True,
+        prepend_runtime: str = "",
     ) -> GenerateResult:
         """Generate Lua source code from an AST node.
 
@@ -388,6 +391,8 @@ class LuaProcessor:
             ast_node: The Lua AST node to generate code from.
             restore_luau_types: If True and Luau metadata exists, restore type annotations.
                                Defaults to True.
+            prepend_runtime: Optional runtime code to prepend to the generated code.
+                           Used for embedded runtime mode. Defaults to empty string.
 
         Returns:
             GenerateResult containing the generated code and any errors.
@@ -414,6 +419,11 @@ class LuaProcessor:
             if restore_luau_types and luau_metadata and self._luau_generator:
                 code = self._luau_generator.restore_type_annotations(code, luau_metadata)
                 self.logger.debug("Restored Luau type annotations to generated code")
+
+            # Prepend runtime code if provided (for embedded mode)
+            if prepend_runtime:
+                code = prepend_runtime + code
+                self.logger.debug(f"Prepended runtime code ({len(prepend_runtime)} chars)")
 
             return GenerateResult(
                 code=code,
@@ -526,6 +536,15 @@ class LuaProcessor:
             self._luajit_detector = LuaJITDetector()
         return self._luajit_detector.detect_luajit_features(source_code)
 
+    def get_engine(self) -> ObfuscationEngine | None:
+        """Get the engine instance used in the last obfuscation.
+
+        Returns:
+            The ObfuscationEngine instance from the last call to
+            obfuscate_with_symbol_table(), or None if not yet called.
+        """
+        return self._current_engine
+
     def extract_symbols(
         self, ast_node: luaparser.astnodes.Chunk, file_path: Path | str
     ) -> LuaSymbolTable:
@@ -598,22 +617,29 @@ class LuaProcessor:
         self,
         ast_node: luaparser.astnodes.Chunk,
         file_path: Path | str,
-        global_table: "GlobalSymbolTable"
-    ) -> GenerateResult:
+        global_table: "GlobalSymbolTable",
+        engine: ObfuscationEngine | None = None,
+    ) -> dict[str, Any]:
         """Obfuscate a Lua AST using a pre-computed GlobalSymbolTable.
 
         This method applies name mangling transformations to the AST using
         the pre-computed mangled names from the GlobalSymbolTable. It ensures
         consistent symbol renaming across files when processing in topological
-        order.
+        order. Supports optional external engine for consistent runtime key generation.
 
         Args:
             ast_node: The Lua AST Chunk node to transform
             file_path: Path to the source file
             global_table: Pre-computed GlobalSymbolTable with mangled names
+            engine: Optional ObfuscationEngine instance. If provided, it will be
+                   used for transformations; otherwise a new engine is created.
 
         Returns:
-            GenerateResult containing the generated code and metadata
+            Dictionary with obfuscation results containing:
+            - code: The generated obfuscated code
+            - success: Whether obfuscation succeeded
+            - errors: List of any error messages
+            - engine: The ObfuscationEngine instance used (for runtime injection)
 
         Example:
             >>> processor = LuaProcessor()
@@ -654,10 +680,15 @@ class LuaProcessor:
 
             # Apply additional transformations via ObfuscationEngine if config exists
             if self._config is not None:
-                from obfuscator.core.obfuscation_engine import ObfuscationEngine
+                # Use provided engine or create new one
+                if engine is not None:
+                    self._current_engine = engine
+                    self.logger.debug("Using provided ObfuscationEngine instance")
+                else:
+                    self._current_engine = ObfuscationEngine(self._config)
+                    self.logger.debug("Created new ObfuscationEngine instance")
 
-                engine = ObfuscationEngine(self._config)
-                engine_result = engine.apply_transformations(
+                engine_result = self._current_engine.apply_transformations(
                     ast_node, "lua", path
                 )
 
@@ -673,15 +704,17 @@ class LuaProcessor:
                         f"Engine transformations failed for {path.name}: "
                         f"{engine_result.errors}"
                     )
-                    return GenerateResult(
-                        code="",
-                        success=False,
-                        errors=engine_result.errors,
-                        warnings=[],
-                    )
+                    return {
+                        "code": "",
+                        "success": False,
+                        "errors": engine_result.errors,
+                        "engine": self._current_engine,
+                    }
 
             # Generate code from the transformed AST
-            gen_result = self.generate_code(ast_node)
+            # Note: Runtime injection is handled by the orchestrator via _inject_embedded_runtime
+            # to ensure it's only applied once and consistently across all languages
+            gen_result = self.generate_code(ast_node, prepend_runtime="")
 
             if gen_result.success:
                 self.logger.info(
@@ -692,18 +725,22 @@ class LuaProcessor:
                     f"Obfuscation of {path.name} completed with errors: {gen_result.errors}"
                 )
 
-            return gen_result
+            return {
+                "code": gen_result.code,
+                "success": gen_result.success,
+                "errors": gen_result.errors,
+                "engine": self._current_engine,
+            }
 
         except Exception as e:
             error_msg = f"Failed to obfuscate {path}: {e}"
             self.logger.error(error_msg, exc_info=True)
-            return GenerateResult(
-                code="",
-                success=False,
-                errors=[error_msg],
-                warnings=[],
-                metadata={"error": str(e)}
-            )
+            return {
+                "code": "",
+                "success": False,
+                "errors": [error_msg],
+                "engine": self._current_engine,
+            }
 
     def apply_transformations(
         self,

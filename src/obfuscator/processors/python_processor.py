@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from obfuscator.core.config import ObfuscationConfig
     from obfuscator.core.symbol_table import GlobalSymbolTable
+from obfuscator.core.obfuscation_engine import ObfuscationEngine
 
 logger = get_logger("obfuscator.processors.python_processor")
 
@@ -194,7 +195,7 @@ class PythonProcessor:
         cycle. This is a fundamental limitation of AST-based code processing.
     """
 
-    def __init__(self, config: "ObfuscationConfig | None" = None) -> None:
+    def __init__(self, config: "ObfuscationConfig | None" = None, engine: "ObfuscationEngine | None" = None) -> None:
         """Initialize the Python processor.
 
         Creates a new PythonProcessor instance ready to parse files
@@ -205,9 +206,21 @@ class PythonProcessor:
                     the engine will apply additional transformations
                     (string encryption, number obfuscation, etc.) after
                     name mangling in ``obfuscate_with_symbol_table()``.
+            engine: Optional ObfuscationEngine instance. When provided,
+                    it will be used for transformations; otherwise a new engine is created.
         """
-        self._config = config
+        self._config = config or ObfuscationConfig()
+        self._current_engine: ObfuscationEngine | None = engine
         logger.debug("PythonProcessor initialized")
+
+    def get_engine(self) -> ObfuscationEngine | None:
+        """Get the engine instance used in the last obfuscation.
+
+        Returns:
+            The ObfuscationEngine instance from the last call to
+            obfuscate_with_symbol_table(), or None if not yet called.
+        """
+        return self._current_engine
 
     def parse_file(self, file_path: Path | str) -> ParseResult:
         """Parse a Python source file into an Abstract Syntax Tree.
@@ -575,24 +588,30 @@ class PythonProcessor:
 
     def obfuscate_with_symbol_table(
         self,
-        ast_node: ast.Module,
-        file_path: Path | str,
-        global_table: "GlobalSymbolTable"
-    ) -> TransformResult:
-        """Obfuscate an AST using a pre-computed GlobalSymbolTable.
+        ast_node: ast.AST,
+        file_path: Path,
+        symbol_table: SymbolTable,
+        engine: ObfuscationEngine | None = None,
+    ) -> dict[str, Any]:
+        """Obfuscate using a pre-computed symbol table with optional engine.
 
-        This method applies name mangling transformations to the AST using
-        the pre-computed mangled names from the GlobalSymbolTable. It ensures
-        consistent symbol renaming across files when processing in topological
-        order.
+        This method applies obfuscation transformations using an optional
+        external engine instance, enabling consistent runtime key generation
+        across the obfuscation pipeline.
 
         Args:
-            ast_node: The AST Module node to transform
-            file_path: Path to the source file
-            global_table: Pre-computed GlobalSymbolTable with mangled names
+            ast_node: The AST node to obfuscate.
+            file_path: Path to the source file (for context).
+            symbol_table: Pre-computed global symbol table for collision avoidance.
+            engine: Optional ObfuscationEngine instance. If provided, it will be
+                   used for transformations; otherwise a new engine is created.
 
         Returns:
-            TransformResult containing the transformed AST and metadata
+            Dictionary with obfuscation results containing:
+            - ast_node: The obfuscated AST node
+            - success: Whether obfuscation succeeded
+            - errors: List of any error messages
+            - engine: The ObfuscationEngine instance used (for runtime injection)
 
         Example:
             >>> processor = PythonProcessor()
@@ -625,7 +644,7 @@ class PythonProcessor:
 
             if mangle_enabled:
                 # Create the name mangling transformer
-                transformer = NameManglingTransformer(global_table, path)
+                transformer = NameManglingTransformer(symbol_table, path)
 
                 # Apply the transformation
                 result = transformer.transform(ast_node)
@@ -638,7 +657,12 @@ class PythonProcessor:
                     logger.warning(
                         f"Obfuscation of {path.name} completed with errors: {result.errors}"
                     )
-                    return result
+                    return {
+                        "ast_node": ast_node,
+                        "success": False,
+                        "errors": result.errors,
+                        "engine": None,
+                    }
             else:
                 logger.info(
                     f"Name mangling disabled for {path.name}; skipping NameManglingTransformer"
@@ -650,12 +674,17 @@ class PythonProcessor:
                     errors=[],
                 )
 
-            # Apply additional transformations via ObfuscationEngine if config exists
+            # Use provided engine or create new one for additional transformations
             if self._config is not None and result.ast_node is not None:
-                from obfuscator.core.obfuscation_engine import ObfuscationEngine
+                if engine is not None:
+                    self._current_engine = engine
+                    logger.debug("Using provided ObfuscationEngine instance")
+                else:
+                    from obfuscator.core.obfuscation_engine import ObfuscationEngine
+                    self._current_engine = ObfuscationEngine(self._config)
+                    logger.debug("Created new ObfuscationEngine instance")
 
-                engine = ObfuscationEngine(self._config)
-                engine_result = engine.apply_transformations(
+                engine_result = self._current_engine.apply_transformations(
                     result.ast_node, "python", path
                 )
 
@@ -664,39 +693,50 @@ class PythonProcessor:
                         f"Engine transformations succeeded for {path.name}: "
                         f"{engine_result.transformation_count} additional transformations"
                     )
-                    return TransformResult(
-                        ast_node=engine_result.ast_node,
-                        success=True,
-                        transformation_count=(
-                            result.transformation_count
-                            + engine_result.transformation_count
-                        ),
-                        errors=result.errors + engine_result.errors,
-                    )
+                    final_ast = engine_result.ast_node
+
+                    # For embedded runtime mode, embed runtime into AST
+                    if self._config.runtime_mode == "embedded" and self._current_engine.has_runtime_requirements():
+                        final_ast = self._current_engine.embed_runtime_in_ast(
+                            engine_result.ast_node, "python"
+                        )
+                        logger.debug("Embedded runtime code into Python AST")
+
+                    return {
+                        "ast_node": final_ast,
+                        "success": True,
+                        "errors": result.errors + engine_result.errors,
+                        "engine": self._current_engine,
+                    }
                 else:
                     logger.error(
                         f"Engine transformations failed for {path.name}: "
                         f"{engine_result.errors}"
                     )
-                    return TransformResult(
-                        ast_node=result.ast_node,
-                        success=False,
-                        transformation_count=result.transformation_count,
-                        errors=result.errors + engine_result.errors,
-                    )
+                    return {
+                        "ast_node": result.ast_node,
+                        "success": False,
+                        "errors": result.errors + engine_result.errors,
+                        "engine": self._current_engine,
+                    }
 
-            return result
+            # No config, just return the name mangling result
+            return {
+                "ast_node": result.ast_node,
+                "success": result.success,
+                "errors": result.errors,
+                "engine": None,
+            }
 
         except Exception as e:
             error_msg = f"Failed to obfuscate {path}: {e}"
             logger.error(error_msg, exc_info=True)
-            return TransformResult(
-                ast_node=ast_node,
-                success=False,
-                errors=[error_msg],
-                warnings=[],
-                metadata={"error": str(e)}
-            )
+            return {
+                "ast_node": ast_node,
+                "success": False,
+                "errors": [error_msg],
+                "engine": None,
+            }
 
     def apply_transformations(
         self,

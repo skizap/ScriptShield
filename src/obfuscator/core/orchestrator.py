@@ -40,9 +40,22 @@ from obfuscator.processors.lua_processor import LuaProcessor
 from obfuscator.processors.symbol_extractor import SymbolTable
 from obfuscator.processors.lua_symbol_extractor import LuaSymbolTable
 from obfuscator.core.config import ObfuscationConfig
+from obfuscator.core.runtime_manager import RuntimeManager
 from obfuscator.utils.logger import get_logger
 
 logger = get_logger("obfuscator.core.orchestrator")
+
+
+@dataclass
+class ProcessedEngine:
+    """Tracks an engine and its associated language for hybrid mode.
+    
+    Attributes:
+        engine: The ObfuscationEngine instance used for transformations.
+        language: The language of the file processed ("python" or "lua").
+    """
+    engine: "ObfuscationEngine"
+    language: str
 
 
 @dataclass
@@ -119,6 +132,7 @@ class ObfuscationOrchestrator:
         self._logger = logger
         self._project_root: Path | None = None
         self._config = config
+        self._processed_engines: list = []
 
     def orchestrate(
         self,
@@ -192,6 +206,7 @@ class ObfuscationOrchestrator:
             ... )
         """
         config = config or {}
+        self._processed_engines = []
         result = OrchestrationResult(success=True)
         total_steps = len(input_files) * 2 + 2  # scan + build + process each file
         current_step = 0
@@ -289,6 +304,12 @@ class ObfuscationOrchestrator:
             result.metadata["total_files"] = len(input_files)
             result.metadata["processed_files"] = len(result.processed_files)
             result.metadata["failed_files"] = failed_count
+            result.metadata["runtime_mode"] = self._config.runtime_mode if self._config else "embedded"
+            result.metadata["runtime_files"] = []
+
+            # Generate hybrid runtime files if in hybrid mode
+            if self._config is not None and self._config.runtime_mode == "hybrid":
+                self._generate_hybrid_runtime_files(output_dir, result)
 
         except Exception as e:
             result.success = False
@@ -546,20 +567,39 @@ class ObfuscationOrchestrator:
                         errors=parse_result.errors or ["Failed to re-parse file"]
                     )
 
+                # Create engine once for this file to ensure consistent runtime keys
+                engine = None
+                if self._config is not None:
+                    from obfuscator.core.obfuscation_engine import ObfuscationEngine
+                    engine = ObfuscationEngine(self._config)
+
                 ast_node = parse_result.ast_node
                 transform_result = self.python_processor.obfuscate_with_symbol_table(
-                    ast_node, file_path, global_table
+                    ast_node, file_path, global_table, engine=engine
                 )
-                if transform_result.success:
+
+                # Get the engine that was used (from processor if not provided)
+                used_engine = transform_result.get("engine") or self.python_processor.get_engine() or engine
+
+                # Track engine for hybrid mode runtime generation with its language
+                if used_engine:
+                    processed_entry = ProcessedEngine(engine=used_engine, language="python")
+                    if processed_entry not in self._processed_engines:
+                        self._processed_engines.append(processed_entry)
+
+                if transform_result["success"]:
                     gen_result = self.python_processor.generate_code(
-                        transform_result.ast_node
+                        transform_result["ast_node"]
                     )
                     # Release AST references to allow garbage collection
                     del ast_node
                     del transform_result
 
                     if gen_result.success:
-                        self._write_output(output_path, gen_result.code)
+                        final_code = self._inject_embedded_runtime(
+                            gen_result.code, "python", used_engine
+                        )
+                        self._write_output(output_path, final_code)
                         return ProcessResult(
                             file_path=file_path,
                             output_path=output_path,
@@ -578,7 +618,7 @@ class ObfuscationOrchestrator:
                         file_path=file_path,
                         output_path=None,
                         success=False,
-                        errors=transform_result.errors
+                        errors=transform_result.get("errors", ["Transformation failed"])
                     )
 
             elif language == "lua":
@@ -591,27 +631,46 @@ class ObfuscationOrchestrator:
                         errors=parse_result.errors or ["Failed to re-parse file"]
                     )
 
+                # Create engine once for this file to ensure consistent runtime keys
+                engine = None
+                if self._config is not None:
+                    from obfuscator.core.obfuscation_engine import ObfuscationEngine
+                    engine = ObfuscationEngine(self._config)
+
                 ast_node = parse_result.ast_node
-                gen_result = self.lua_processor.obfuscate_with_symbol_table(
-                    ast_node, file_path, global_table
+                transform_result = self.lua_processor.obfuscate_with_symbol_table(
+                    ast_node, file_path, global_table, engine=engine
                 )
+
+                # Get the engine that was used (from processor if not provided)
+                used_engine = transform_result.get("engine") or self.lua_processor.get_engine() or engine
+
+                # Track engine for hybrid mode runtime generation with its language
+                if used_engine:
+                    processed_entry = ProcessedEngine(engine=used_engine, language="lua")
+                    if processed_entry not in self._processed_engines:
+                        self._processed_engines.append(processed_entry)
+
                 # Release AST reference to allow garbage collection
                 del ast_node
 
-                if gen_result.success:
-                    self._write_output(output_path, gen_result.code)
+                if transform_result["success"]:
+                    final_code = self._inject_embedded_runtime(
+                        transform_result["code"], "lua", used_engine
+                    )
+                    self._write_output(output_path, final_code)
                     return ProcessResult(
                         file_path=file_path,
                         output_path=output_path,
                         success=True,
-                        warnings=gen_result.warnings
+                        warnings=[]
                     )
                 else:
                     return ProcessResult(
                         file_path=file_path,
                         output_path=None,
                         success=False,
-                        errors=gen_result.errors
+                        errors=transform_result.get("errors", ["Transformation failed"])
                     )
             else:
                 return ProcessResult(
@@ -629,6 +688,310 @@ class ObfuscationOrchestrator:
                 success=False,
                 errors=[str(e)]
             )
+
+    def _inject_embedded_runtime(
+        self,
+        code: str,
+        language: str,
+        engine: "ObfuscationEngine | None" = None
+    ) -> str:
+        """Inject embedded runtime code into obfuscated code.
+
+        Uses the provided ObfuscationEngine's runtime_manager (if available) or
+        creates a new RuntimeManager to check if runtime requirements exist,
+        and prepends formatted runtime code if needed.
+
+        Args:
+            code: The obfuscated code to inject runtime into.
+            language: Target language ("python" or "lua").
+            engine: Optional ObfuscationEngine instance used for transformations.
+                   If provided, its runtime_manager will be used to ensure key
+                   consistency between transformed code and runtime code.
+
+        Returns:
+            Code with embedded runtime prepended, or original code if no runtime needed.
+        """
+        try:
+            # Check if in hybrid mode - inject imports instead of embedded runtime
+            if self._config is not None and self._config.runtime_mode == "hybrid":
+                return self._inject_hybrid_imports(code, language, engine)
+
+            # Only proceed with embedded runtime if explicitly in embedded mode
+            if self._config is None or self._config.runtime_mode != "embedded":
+                return code
+            # Use the engine's tracked required_runtimes when available, otherwise fallback
+            if engine is not None:
+                # Use engine's tracked features (only those actually applied)
+                has_runtime = engine.has_runtime_requirements()
+                if has_runtime:
+                    runtime_code = engine.get_required_runtime_code(language)
+                else:
+                    runtime_code = ""
+            else:
+                # Fallback: create a new RuntimeManager to check all enabled features
+                runtime_manager = RuntimeManager(self._config)
+                has_runtime = runtime_manager.has_runtime_requirements(language)
+                if has_runtime:
+                    runtime_code = runtime_manager.get_combined_runtime(language)
+                else:
+                    runtime_code = ""
+
+            if not runtime_code:
+                return code
+
+            # Format runtime code with language-specific headers
+            if language == "python":
+                separator = "# " + "=" * 70
+                header = (
+                    f"{separator}\n"
+                    f"# EMBEDDED OBFUSCATION RUNTIME\n"
+                    f"{separator}\n\n"
+                )
+                footer = (
+                    f"\n\n{separator}\n"
+                    f"# END RUNTIME CODE\n"
+                    f"{separator}\n\n"
+                )
+            elif language == "lua":
+                separator = "-- " + "=" * 70
+                header = (
+                    f"{separator}\n"
+                    f"-- EMBEDDED OBFUSCATION RUNTIME\n"
+                    f"{separator}\n\n"
+                )
+                footer = (
+                    f"\n\n{separator}\n"
+                    f"-- END RUNTIME CODE\n"
+                    f"{separator}\n\n"
+                )
+            else:
+                # Fallback for unsupported languages
+                return code
+
+            self._logger.info(
+                f"Injected embedded runtime code for {language} ({len(runtime_code)} chars)"
+            )
+
+            return header + runtime_code + footer + code
+
+        except Exception as e:
+            self._logger.warning(f"Failed to inject runtime code: {e}")
+            return code
+
+    def _inject_hybrid_imports(
+        self,
+        code: str,
+        language: str,
+        engine: "ObfuscationEngine | None" = None
+    ) -> str:
+        """Inject import statements for hybrid mode runtime.
+
+        Instead of embedding runtime code, this method prepends import/require
+        statements that reference the shared runtime file (obf_runtime.py or
+        obf_runtime.lua) generated after all files are processed.
+
+        Args:
+            code: The obfuscated code to inject imports into.
+            language: Target language ("python" or "lua").
+            engine: Optional ObfuscationEngine instance used for transformations.
+
+        Returns:
+            Code with import statements prepended, or original code if no imports needed.
+        """
+        try:
+            # Check if engine has runtime requirements
+            if engine is None or not engine.has_runtime_requirements():
+                return code
+
+            # Get required runtime types from the engine
+            required_runtimes = engine.required_runtimes
+            if not required_runtimes:
+                return code
+
+            # Generate import statements for each required runtime
+            runtime_manager = RuntimeManager(self._config) if self._config else None
+            if runtime_manager is None:
+                return code
+
+            import_statements: list[str] = []
+
+            if language == "python":
+                # Add comment header for Python
+                import_statements.append("# Obfuscation Runtime Imports")
+
+                # Collect all function names from required runtimes
+                all_functions: list[str] = []
+                for runtime_type in required_runtimes:
+                    functions = runtime_manager.get_runtime_function_names(runtime_type)
+                    all_functions.extend(functions)
+
+                # Generate single import statement for all functions
+                if all_functions:
+                    import_statements.append(
+                        f"from obf_runtime import {', '.join(all_functions)}"
+                    )
+
+                import_statements.append("")  # Empty line after imports
+                import_statements.append(f"# {'=' * 70}")
+                import_statements.append("")
+
+            elif language == "lua":
+                # Add comment header for Lua
+                import_statements.append("-- Obfuscation Runtime Imports")
+                # Single require statement for all runtimes
+                import_statements.append('local rt = require("obf_runtime")')
+                import_statements.append("")  # Empty line after imports
+                import_statements.append(f"-- {'=' * 70}")
+                import_statements.append("")
+
+            else:
+                # Unsupported language - return code unchanged
+                return code
+
+            combined_imports = "\n".join(import_statements)
+            self._logger.info(
+                f"Injected hybrid imports for {language} ({len(required_runtimes)} runtime modules)"
+            )
+
+            return combined_imports + code
+
+        except Exception as e:
+            self._logger.warning(f"Failed to inject hybrid imports: {e}")
+            return code
+
+    def _generate_hybrid_runtime_files(
+        self,
+        output_dir: Path,
+        result: OrchestrationResult
+    ) -> None:
+        """Generate shared runtime files for hybrid mode.
+
+        Collects all unique runtime requirements from tracked engines and generates
+        consolidated runtime files (obf_runtime.py and/or obf_runtime.lua) in
+        the output directory root.
+
+        Args:
+            output_dir: Directory to write runtime files to.
+            result: OrchestrationResult to update with runtime file metadata.
+        """
+        try:
+            # Validate output directory
+            if not output_dir.exists():
+                self._logger.warning(
+                    f"Output directory does not exist: {output_dir}, skipping runtime generation"
+                )
+                return
+
+            if not output_dir.is_dir():
+                self._logger.warning(
+                    f"Output path is not a directory: {output_dir}, skipping runtime generation"
+                )
+                return
+
+            # Collect all unique runtime requirements from tracked engines
+            python_runtimes: set[str] = set()
+            lua_runtimes: set[str] = set()
+
+            for entry in self._processed_engines:
+                engine = entry.engine
+                language = entry.language
+                
+                if hasattr(engine, 'required_runtimes') and engine.required_runtimes:
+                    if language == "python":
+                        python_runtimes.update(engine.required_runtimes)
+                    elif language == "lua":
+                        lua_runtimes.update(engine.required_runtimes)
+
+            # Generate runtime files for each language
+            runtime_files: list[str] = []
+
+            for language, runtimes in [("python", python_runtimes), ("lua", lua_runtimes)]:
+                if not runtimes:
+                    continue
+
+                try:
+                    # Find the first engine for this language to use its runtime_manager
+                    target_engine = None
+                    for entry in self._processed_engines:
+                        if entry.language == language:
+                            target_engine = entry.engine
+                            break
+                    
+                    if target_engine is None or not hasattr(target_engine, 'runtime_manager'):
+                        self._logger.warning(
+                            f"No engine with runtime_manager found for {language}, skipping runtime generation"
+                        )
+                        continue
+
+                    runtime_manager = target_engine.runtime_manager
+                    
+                    # Generate runtime code only for required runtimes using the engine's stored keys
+                    parts: list[str] = []
+                    
+                    # Add header comment
+                    if language == "python":
+                        parts.append('# Obfuscation Runtime Code - Applied Features')
+                        parts.append('# Generated by ScriptShield RuntimeManager')
+                        parts.append('')
+                    else:  # lua
+                        parts.append('-- Obfuscation Runtime Code - Applied Features')
+                        parts.append('-- Generated by ScriptShield RuntimeManager')
+                        parts.append('')
+                    
+                    # Generate runtime code only for required runtimes
+                    for i, runtime_type in enumerate(runtimes):
+                        code = runtime_manager.generate_runtime_code(runtime_type, language)
+                        if code:
+                            if i > 0:
+                                # Add separator between runtimes
+                                if language == "python":
+                                    parts.append(f'\n# {"=" * 60}')
+                                    parts.append(f'# Runtime: {runtime_type}')
+                                    parts.append(f'# {"=" * 60}\n')
+                                else:  # lua
+                                    parts.append(f'\n-- {"=" * 60}')
+                                    parts.append(f'-- Runtime: {runtime_type}')
+                                    parts.append(f'-- {"=" * 60}\n')
+                            parts.append(code)
+                            self._logger.debug(f"Generated runtime code for {runtime_type} ({language})")
+                    
+                    runtime_code = '\n'.join(parts)
+
+                    if not runtime_code:
+                        self._logger.debug(
+                            f"No runtime code generated for {language}, skipping file"
+                        )
+                        continue
+
+                    # Determine output filename
+                    filename = "obf_runtime.py" if language == "python" else "obf_runtime.lua"
+                    runtime_path = output_dir / filename
+
+                    # Write runtime file
+                    runtime_path.write_text(runtime_code, encoding="utf-8")
+                    runtime_files.append(str(runtime_path))
+
+                    self._logger.info(
+                        f"Generated hybrid runtime file: {filename} "
+                        f"({len(runtime_code)} chars, {len(runtimes)} modules)"
+                    )
+
+                except Exception as e:
+                    self._logger.warning(
+                        f"Failed to generate {language} runtime file: {e}"
+                    )
+                    # Don't fail the entire orchestration - continue with other languages
+
+            # Update result metadata with runtime file information
+            if runtime_files:
+                if "runtime_files" not in result.metadata:
+                    result.metadata["runtime_files"] = []
+                result.metadata["runtime_files"].extend(runtime_files)
+                result.metadata["runtime_file_count"] = len(runtime_files)
+
+        except Exception as e:
+            self._logger.warning(f"Failed to generate hybrid runtime files: {e}")
+            # Don't fail the entire orchestration - log and continue
 
     def _write_output(self, output_path: Path, code: str) -> None:
         """Write obfuscated code to output file.

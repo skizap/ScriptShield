@@ -102,15 +102,21 @@ transformations, including error tracking, transformation counting,
         >>> print(f"Transformed {result.transformation_count} nodes")
     """
 
-    def __init__(self) -> None:
+    def __init__(self, **kwargs) -> None:
         """Initialize the AST transformer.
 
         Sets up tracking attributes for transformation counting and error collection.
+
+        Args:
+            **kwargs: Optional keyword arguments, including:
+                runtime_manager: Optional RuntimeManager instance for accessing
+                                runtime keys and shared state across transformers.
         """
         super().__init__()
         self.transformation_count: int = 0
         self.errors: list[str] = []
-        self.logger =logger
+        self.logger = logger
+        self.runtime_manager = kwargs.get('runtime_manager', None)
 
     def transform(self, ast_node: ast.AST) -> TransformResult:
         """Apply this transformer to an AST node.
@@ -223,6 +229,7 @@ class ConstantArrayTransformer(ASTTransformer):
         self,
         config: Optional[Any] = None,
         shuffle_seed: Optional[int] = None,
+        **kwargs
     ) -> None:
         """Initialize the constant array transformer.
 
@@ -231,8 +238,9 @@ class ConstantArrayTransformer(ASTTransformer):
                    If provided, shuffle_seed is extracted from config.options.
             shuffle_seed: Seed for random shuffling. If None, uses random seed.
                          If int, uses deterministic seed for reproducibility.
+            **kwargs: Additional keyword arguments passed to parent class.
         """
-        super().__init__()
+        super().__init__(**kwargs)
         self.logger = get_logger("obfuscator.processors.constant_array")
 
         # Determine shuffle seed from config or parameter
@@ -871,9 +879,9 @@ class ConstantFoldingTransformer(ASTTransformer):
         unchanged.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, **kwargs) -> None:
         """Initialize the constant folding transformer."""
-        super().__init__()
+        super().__init__(**kwargs)
         self.logger = get_logger("obfuscator.processors.ast_transformer")
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
