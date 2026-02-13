@@ -48,6 +48,12 @@ class ProgressWidget(QWidget):
         title_label.setStyleSheet(get_widget_style("title_label"))
         layout.addWidget(title_label)
 
+        # Add state label between title and progress bar
+        self.state_label = QLabel("Current State: PENDING")
+        self.state_label.setProperty("data-element-id", "progress-state-label")
+        self.state_label.setStyleSheet("color: #888888; font-size: 12px; font-weight: bold;")
+        layout.addWidget(self.state_label)
+
         # Create progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setProperty("data-element-id", "progress-bar")
@@ -102,6 +108,35 @@ class ProgressWidget(QWidget):
         self.setVisible(False)
         self.cancel_button.setVisible(False)
         self.logger.info("Progress widget hidden")
+
+    def set_state(self, state_name: str):
+        """Set the current state display with color coding.
+
+        Args:
+            state_name: The name of the current state (e.g., "VALIDATING", "PROCESSING")
+        """
+        # Define color coding for each state
+        color_map = {
+            "PENDING": "#888888",  # Gray
+            "VALIDATING": "#FFA500",  # Orange
+            "ANALYZING": "#0088FF",  # Blue
+            "PROCESSING": "#00AA00",  # Green
+            "COMPLETED": "#00CC00",  # Bright Green
+            "FAILED": "#CC0000",  # Red
+            "CANCELLED": "#888888",  # Gray
+        }
+        color = color_map.get(state_name, "#888888")
+        self.state_label.setText(f"Current State: {state_name}")
+        self.state_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: bold;")
+        self.logger.debug(f"State updated to: {state_name}")
+
+    def get_state(self) -> str:
+        """Get the current state text.
+
+        Returns:
+            The current state string (e.g., "Current State: PENDING")
+        """
+        return self.state_label.text()
 
     def is_visible(self) -> bool:
         """Check if the progress widget is visible."""
@@ -162,6 +197,7 @@ class ProgressWidget(QWidget):
     def reset(self):
         """Reset the progress widget to initial state."""
         self.set_progress(0)
+        self.set_state("PENDING")
         self.clear_logs()
         self.hide_progress()
         self.logger.info("Progress widget reset")

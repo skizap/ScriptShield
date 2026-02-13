@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,8 +43,33 @@ from obfuscator.processors.lua_symbol_extractor import LuaSymbolTable
 from obfuscator.core.config import ObfuscationConfig
 from obfuscator.core.runtime_manager import RuntimeManager
 from obfuscator.utils.logger import get_logger
+from obfuscator.utils.path_utils import is_readable, is_writable
 
 logger = get_logger("obfuscator.core.orchestrator")
+
+
+class JobState(Enum):
+    """Enumeration of possible job states during obfuscation orchestration.
+
+    The job state tracks the current phase of the obfuscation process,
+    providing clear feedback about where the orchestration currently stands.
+
+    States:
+        PENDING: Initial state, job created but not started
+        VALIDATING: Input validation phase (files, directories, config)
+        ANALYZING: Scanning files and building dependency graph
+        PROCESSING: Obfuscating files in topological order
+        COMPLETED: All files processed successfully
+        FAILED: Error occurred during processing
+        CANCELLED: Job was cancelled by user (future phase)
+    """
+    PENDING = "pending"
+    VALIDATING = "validating"
+    ANALYZING = "analyzing"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -82,6 +108,7 @@ class OrchestrationResult:
 
     Attributes:
         success: Whether the overall process succeeded
+        current_state: Current state of the job (PENDING, VALIDATING, etc.)
         processed_files: List of ProcessResult for each file
         dependency_graph: The constructed dependency graph
         global_symbol_table: The pre-computed symbol table
@@ -90,12 +117,27 @@ class OrchestrationResult:
         metadata: Additional metadata about the process
     """
     success: bool
+    current_state: JobState = field(default=JobState.PENDING)
     processed_files: list[ProcessResult] = field(default_factory=list)
     dependency_graph: DependencyGraph | None = None
     global_symbol_table: GlobalSymbolTable | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ValidationResult:
+    """Result of input validation checks.
+    
+    Attributes:
+        success: Whether all validation checks passed
+        errors: List of validation error messages
+        warnings: List of validation warning messages
+    """
+    success: bool
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 class ObfuscationOrchestrator:
@@ -133,6 +175,22 @@ class ObfuscationOrchestrator:
         self._project_root: Path | None = None
         self._config = config
         self._processed_engines: list = []
+        self._current_state: JobState = JobState.PENDING
+
+    def _transition_state(self, new_state: JobState, result: OrchestrationResult) -> None:
+        """Transition the orchestrator to a new state.
+
+        Updates both the internal _current_state and the result.current_state,
+        and logs the transition for debugging purposes.
+
+        Args:
+            new_state: The state to transition to
+            result: The OrchestrationResult to update with the new state
+        """
+        old_state = self._current_state
+        self._current_state = new_state
+        result.current_state = new_state
+        self._logger.info(f"State transition: {old_state.name} -> {new_state.name}")
 
     def orchestrate(
         self,
@@ -169,6 +227,97 @@ class ObfuscationOrchestrator:
             config=config_dict,
             progress_callback=progress_callback,
             project_root=proj_root
+        )
+
+    def validate_inputs(
+        self,
+        input_files: list[Path],
+        output_dir: Path
+    ) -> ValidationResult:
+        """Validate all inputs before processing begins.
+        
+        Performs comprehensive pre-flight checks including file existence,
+        readability, valid extensions, and output directory writability.
+        
+        Args:
+            input_files: List of input file paths to validate
+            output_dir: Output directory to validate
+            
+        Returns:
+            ValidationResult with success flag and error/warning messages
+        """
+        errors: list[str] = []
+        warnings: list[str] = []
+        
+        self._logger.info("Starting input validation...")
+        
+        # Empty file list check
+        if not input_files:
+            errors.append("No input files provided")
+            self._logger.debug("Input file list is empty")
+        else:
+            self._logger.debug(f"Checking {len(input_files)} input files...")
+            
+            # Valid extensions
+            valid_extensions = {".py", ".pyw", ".lua", ".luau"}
+            
+            for file_path in input_files:
+                # Resolve path for consistent handling (handles symlinks)
+                resolved_path = file_path.resolve()
+                
+                # File existence check
+                if not resolved_path.exists():
+                    errors.append(f"File not found: {file_path}")
+                    continue
+                
+                # File readability check
+                if not is_readable(resolved_path):
+                    errors.append(f"File is not readable: {file_path}")
+                    continue
+                
+                # File type validation
+                extension = resolved_path.suffix.lower()
+                if extension not in valid_extensions:
+                    errors.append(
+                        f"Unsupported file extension '{extension}' for file: {file_path}. "
+                        f"Supported: .py, .pyw, .lua, .luau"
+                    )
+        
+        # ObfuscationConfig validation
+        if self._config is not None:
+            try:
+                self._config.validate()
+            except ValueError as e:
+                errors.append(f"Configuration validation failed: {e}")
+        
+        # Output directory writability check
+        resolved_output = output_dir.resolve()
+        
+        if resolved_output.exists():
+            if resolved_output.is_dir():
+                # Check if directory is writable using utility
+                if not is_writable(resolved_output):
+                    errors.append(f"Output directory is not writable: {output_dir}")
+            else:
+                errors.append(f"Output path exists but is not a directory: {output_dir}")
+        else:
+            # Output directory doesn't exist, check if parent exists and is readable/writable
+            parent_dir = resolved_output.parent
+            if not parent_dir.exists():
+                errors.append(f"Cannot create output directory (parent does not exist): {output_dir}")
+            else:
+                # Check if parent is readable and writable using utilities
+                if not is_readable(parent_dir):
+                    errors.append(f"Cannot create output directory (parent not readable): {output_dir}")
+                if not is_writable(parent_dir):
+                    errors.append(f"Cannot create output directory (parent not writable): {output_dir}")
+        
+        self._logger.info(f"Validation completed: {len(errors)} errors, {len(warnings)} warnings")
+        
+        return ValidationResult(
+            success=len(errors) == 0,
+            errors=errors,
+            warnings=warnings
         )
 
     def process_files(
@@ -208,15 +357,38 @@ class ObfuscationOrchestrator:
         config = config or {}
         self._processed_engines = []
         result = OrchestrationResult(success=True)
-        total_steps = len(input_files) * 2 + 2  # scan + build + process each file
+        total_steps = len(input_files) + 4  # validation + scan + build + pre-compute + one per file
         current_step = 0
+
+        # Initialize state to PENDING
+        self._transition_state(JobState.PENDING, result)
 
         def report_progress(message: str) -> None:
             nonlocal current_step
             current_step += 1
+            state_prefix = f"State: {self._current_state.name} - "
+            full_message = state_prefix + message
             if progress_callback:
-                progress_callback(message, current_step, total_steps)
+                progress_callback(full_message, current_step, total_steps)
             self._logger.info(message)
+
+        # Transition to VALIDATING and validate inputs before processing
+        self._transition_state(JobState.VALIDATING, result)
+        report_progress("Validating inputs...")
+        validation_result = self.validate_inputs(input_files, output_dir)
+
+        if not validation_result.success:
+            result.success = False
+            result.errors.extend(validation_result.errors)
+            result.warnings.extend(validation_result.warnings)
+            self._logger.error(f"Input validation failed with {len(validation_result.errors)} error(s)")
+            # Transition to FAILED before returning
+            self._transition_state(JobState.FAILED, result)
+            return result
+
+        # Add any validation warnings to result
+        if validation_result.warnings:
+            result.warnings.extend(validation_result.warnings)
 
         # Compute project root from all input files if not explicitly provided
         if project_root is None and input_files:
@@ -237,6 +409,9 @@ class ObfuscationOrchestrator:
         self._project_root = project_root
 
         try:
+            # Transition to ANALYZING for scan and symbol extraction
+            self._transition_state(JobState.ANALYZING, result)
+
             # Phase 1: Scan and extract symbols (ASTs are discarded to bound memory)
             report_progress("Scanning files and extracting symbols...")
             successfully_parsed, symbol_tables = self._scan_and_extract_symbols(
@@ -246,6 +421,8 @@ class ObfuscationOrchestrator:
             if not successfully_parsed:
                 result.success = False
                 result.errors.append("No files were successfully parsed")
+                # Transition to FAILED before returning
+                self._transition_state(JobState.FAILED, result)
                 return result
 
             # Phase 2: Build dependency graph and symbol table
@@ -274,6 +451,9 @@ class ObfuscationOrchestrator:
 
             # Ensure output directory exists
             output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Transition to PROCESSING before file processing loop
+            self._transition_state(JobState.PROCESSING, result)
 
             for file_path in processing_order:
                 if file_path not in successfully_parsed:
@@ -307,6 +487,10 @@ class ObfuscationOrchestrator:
             result.metadata["runtime_mode"] = self._config.runtime_mode if self._config else "embedded"
             result.metadata["runtime_files"] = []
 
+            # Transition to COMPLETED after successful processing
+            self._transition_state(JobState.COMPLETED, result)
+            report_progress("Job completed")
+
             # Generate hybrid runtime files if in hybrid mode
             if self._config is not None and self._config.runtime_mode == "hybrid":
                 self._generate_hybrid_runtime_files(output_dir, result)
@@ -315,6 +499,9 @@ class ObfuscationOrchestrator:
             result.success = False
             result.errors.append(f"Orchestration failed: {e}")
             self._logger.error(f"Orchestration failed: {e}", exc_info=True)
+            # Transition to FAILED on exception
+            self._transition_state(JobState.FAILED, result)
+            report_progress("Job failed")
 
         return result
 

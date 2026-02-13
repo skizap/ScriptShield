@@ -31,7 +31,7 @@ from obfuscator.gui.widgets import (
 from obfuscator.gui.styles.stylesheet import get_application_stylesheet
 from obfuscator.utils.logger import get_logger
 from obfuscator.utils.path_utils import get_platform, normalize_path
-from obfuscator.core.orchestrator import ObfuscationOrchestrator
+from obfuscator.core.orchestrator import ObfuscationOrchestrator, JobState
 
 # Module-level logger
 logger = get_logger("obfuscator.gui.main_window")
@@ -263,7 +263,22 @@ class MainWindow(QMainWindow):
         def on_progress(message: str, current: int, total: int) -> None:
             progress_percent = int((current / total) * 100) if total > 0 else 0
             self.progress_widget.set_progress(progress_percent)
-            self.progress_widget.add_log_entry(message, "info")
+
+            # Extract state from message format "State: {STATE_NAME} - {message}"
+            if message.startswith("State: "):
+                # Parse state prefix: "State: VALIDATING - Validating inputs..."
+                parts = message.split(" - ", 1)
+                if len(parts) == 2:
+                    state_part = parts[0]  # "State: VALIDATING"
+                    state_name = state_part.replace("State: ", "")  # "VALIDATING"
+                    actual_message = parts[1]  # "Validating inputs..."
+                    self.progress_widget.set_state(state_name)
+                    self.progress_widget.add_log_entry(actual_message, "info")
+                else:
+                    self.progress_widget.add_log_entry(message, "info")
+            else:
+                self.progress_widget.add_log_entry(message, "info")
+
             # Process events to keep GUI responsive
             QApplication.processEvents()
 
