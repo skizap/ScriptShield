@@ -485,6 +485,204 @@ encounter errors.
 | Language-aware filtering | Only instantiate transformers compatible with the target language |
 | Graceful degradation | If transformations fail, fall back to name-mangling only rather than failing completely |
 
+## Orchestration Workflow
+
+The `ObfuscationOrchestrator` implements a stateful, multi-phase workflow with
+comprehensive support for validation, conflict resolution, cancellation, error
+handling with user interaction, and detailed progress tracking with time
+estimation.
+
+### Job State Machine
+
+The orchestrator tracks its current phase via `JobState`. Each `process_files()`
+call transitions through the following states:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> VALIDATING: process_files() called
+    VALIDATING --> FAILED: Validation errors
+    VALIDATING --> ANALYZING: Validation passed
+    ANALYZING --> PROCESSING: Dependencies resolved
+    PROCESSING --> COMPLETED: All files processed
+    PROCESSING --> FAILED: Processing error (STOP strategy)
+    PROCESSING --> CANCELLED: Cancellation requested
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
+```
+
+### Orchestrator–GUI Interaction
+
+The orchestrator communicates with the GUI layer through three callback
+channels: progress updates, error dialogs, and conflict resolution dialogs.
+
+```mermaid
+sequenceDiagram
+    participant GUI as Main Window
+    participant O as Orchestrator
+    participant PW as ProgressWidget
+    participant ED as ErrorDialog
+    participant CD as ConflictDialog
+
+    GUI->>O: process_files()
+    O->>O: validate_inputs()
+    O->>O: detect_conflicts()
+    alt Conflicts detected
+        O->>CD: Show conflict dialog
+        CD->>GUI: User selects strategy
+        GUI->>O: Set conflict strategy
+    end
+    O->>PW: State: VALIDATING
+    O->>PW: State: ANALYZING
+    O->>PW: State: PROCESSING
+    loop For each file
+        O->>PW: Update progress (file, %, time)
+        alt Processing error
+            O->>ED: Show error dialog
+            ED->>GUI: User decides continue/stop
+            GUI->>O: Return decision
+        end
+        alt Cancellation requested
+            GUI->>O: request_cancellation()
+            O->>O: Transition to CANCELLED
+        end
+    end
+    O->>PW: State: COMPLETED
+    O->>GUI: Return OrchestrationResult
+```
+
+### Error Handling Strategies
+
+When a file fails to process, the orchestrator consults the configured
+`ErrorStrategy` to decide how to proceed:
+
+| Strategy | Behavior | Use Case |
+|----------|----------|----------|
+| CONTINUE | Skip failed file, continue with remaining files | Batch processing where partial results are acceptable |
+| STOP | Immediately halt processing on first error | Critical workflows where all files must succeed |
+| ASK | Prompt user for decision on each error | Interactive GUI mode with user oversight |
+
+Error decisions and failed file lists are recorded in
+`OrchestrationResult.metadata` under `error_decisions` and
+`files_failed_with_errors`.
+
+### Conflict Resolution Strategies
+
+When output files already exist, the orchestrator uses the configured
+`ConflictStrategy` to handle the conflict:
+
+| Strategy | Behavior | Use Case |
+|----------|----------|----------|
+| OVERWRITE | Replace existing files without prompting | Automated workflows, development iterations |
+| SKIP | Skip files that already exist | Incremental processing, avoid data loss |
+| RENAME | Append timestamp to create unique filename | Preserve both old and new versions |
+| ASK | Prompt user for decision on each conflict | Interactive GUI mode (not yet implemented) |
+
+For the RENAME strategy, the new filename follows the pattern
+`<stem>_YYYYMMDD_HHMMSS<ext>` (e.g., `main_20260213_143022.py`).
+
+### Progress Tracking
+
+The `ProgressInfo` dataclass encapsulates all progress-related information:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `current_file` | `str \| None` | Name of the file currently being processed |
+| `current_index` | `int` | Current step index |
+| `total_files` | `int` | Total number of steps |
+| `percentage` | `float` | Progress percentage (0.0–100.0) |
+| `elapsed_seconds` | `float` | Elapsed time since processing started |
+| `estimated_remaining_seconds` | `float \| None` | Estimated remaining time, or None |
+| `current_state` | `JobState` | Current state of the orchestration |
+| `message` | `str` | Human-readable progress message |
+
+Time estimation uses a rolling average of per-file processing times.  The first
+file reports `estimated_remaining_seconds = None` since no data is yet
+available.
+
+### Cancellation
+
+Cancellation is requested via `request_cancellation()`, which sets a flag
+checked at two strategic points:
+
+1. Before the processing loop begins (immediate cancellation).
+2. At the start of each file iteration (between-file cancellation).
+
+Files already written to disk are preserved.  The `OrchestrationResult`
+includes metadata about which files were completed and which were skipped.
+
+## Testing Strategy
+
+Testing is organized around **pytest** with the following conventions:
+
+### Test Organization
+
+- **Unit tests** (`tests/core/`, `tests/processors/`, `tests/utils/`): Test
+  individual classes and methods in isolation, using mocks for external
+  dependencies.
+- **Integration tests** (`test_orchestrator_full_pipeline.py`,
+  `test_orchestrator_workflow.py`): Test end-to-end workflows through the
+  orchestrator, exercising real processors and file I/O.
+
+### Fixture Usage
+
+Shared fixtures are defined in `tests/core/conftest.py`:
+
+- `tmp_project`: Creates a temporary directory structure with `src/` and
+  `output/` subdirectories.
+- `sample_python_files` / `sample_lua_files`: Pre-created test files.
+- `sample_config`: A valid `ObfuscationConfig` for testing.
+- `orchestrator_instance`: A pre-configured `ObfuscationOrchestrator`.
+- `mock_progress_callback` / `mock_error_callback` / `mock_conflict_callback`:
+  Mock functions for GUI callback simulation.
+
+### Mock Callback Patterns
+
+GUI integration is tested by passing mock callbacks to `process_files()`:
+
+- **Progress**: Capture `ProgressInfo` objects to verify state transitions,
+  percentage calculations, and time estimates.
+- **Error**: Return `True` (continue) or `False` (stop) to simulate user
+  decisions in `ErrorHandlingDialog`.
+- **Conflict**: Return a `ConflictStrategy` to simulate user decisions in
+  `ConflictResolutionDialog`.
+
+### Edge Case Coverage
+
+Tests explicitly cover:
+
+- Empty file lists and nonexistent files
+- Permission errors (unreadable files, read-only output directories)
+- Invalid file extensions and malformed configurations
+- Mid-process cancellation with partial results
+- Unicode file paths and symlink resolution
+- Circular dependencies combined with cancellation
+- Large file counts (100+ files) for performance validation
+
+### Running Tests
+
+```bash
+# Run workflow tests
+pytest tests/core/test_orchestrator_workflow.py
+
+# Run with coverage
+pytest tests/core/test_orchestrator_workflow.py \
+    --cov=src/obfuscator/core/orchestrator \
+    --cov-report=term-missing
+
+# Run all core tests
+pytest tests/core/
+```
+
+### Coverage Expectations
+
+Aim for >90% line coverage of workflow-related code in `orchestrator.py`,
+including `validate_inputs()`, `_transition_state()`, `detect_conflicts()`,
+`resolve_conflict()`, `request_cancellation()`, and `handle_processing_error()`.
+Intentionally uncovered lines include defensive fallbacks for unknown enum
+values and edge cases that are unreachable in normal operation.
+
 ## Future Architecture
 
 Planned architectural extensions include:

@@ -141,6 +141,7 @@ class ObfuscationConfig:
         "preserve_constants": False,
     })
     runtime_mode: str = "hybrid"
+    conflict_strategy: str = "ask"
     
     def validate(self) -> None:
         """Validate the configuration.
@@ -171,6 +172,14 @@ class ObfuscationConfig:
         if self.runtime_mode not in ("hybrid", "embedded"):
             raise ValueError(
                 f"Invalid runtime_mode: {self.runtime_mode}. Expected 'hybrid' or 'embedded'"
+            )
+
+        # Check conflict_strategy
+        valid_conflict_strategies = {"overwrite", "skip", "rename", "ask"}
+        if self.conflict_strategy not in valid_conflict_strategies:
+            raise ValueError(
+                f"Invalid conflict_strategy: {self.conflict_strategy}. "
+                f"Expected one of {valid_conflict_strategies}"
             )
         
         # Check features
@@ -409,6 +418,7 @@ class ObfuscationConfig:
             "language": self.language,
             "preset": self.preset,
             "runtime_mode": self.runtime_mode,
+            "conflict_strategy": self.conflict_strategy,
             "features": self.features.copy(),
             "options": self.options.copy(),
             "symbol_table_options": self.symbol_table_options.copy(),
@@ -471,6 +481,7 @@ class ObfuscationConfig:
                     "preserve_constants": False,
                 }),
                 runtime_mode=data.get("runtime_mode", "hybrid"),
+                conflict_strategy=data.get("conflict_strategy", "ask"),
             )
             logger.debug(f"Created configuration from dictionary: {config.name}")
             return config
@@ -546,6 +557,7 @@ class ObfuscationConfig:
                 "preserve_constants": False,
             },
             runtime_mode="hybrid",
+            conflict_strategy="ask",
         )
 
         logger.debug(

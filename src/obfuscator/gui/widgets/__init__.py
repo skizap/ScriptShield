@@ -11,6 +11,8 @@ Example:
 """
 
 from .action_widget import ActionWidget
+from .conflict_dialog import ConflictResolutionDialog
+from .error_dialog import ErrorHandlingDialog
 from .file_selection_widget import FileSelectionWidget
 from .info_panel_widget import InfoPanelWidget
 from .output_widget import OutputWidget
@@ -20,6 +22,8 @@ from .security_config_widget import SecurityConfigWidget
 
 __all__ = [
     "ActionWidget",
+    "ConflictResolutionDialog",
+    "ErrorHandlingDialog",
     "FileSelectionWidget",
     "InfoPanelWidget",
     "OutputWidget",

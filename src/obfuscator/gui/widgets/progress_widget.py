@@ -54,6 +54,17 @@ class ProgressWidget(QWidget):
         self.state_label.setStyleSheet("color: #888888; font-size: 12px; font-weight: bold;")
         layout.addWidget(self.state_label)
 
+        # Add time info labels
+        self.time_label = QLabel("Elapsed: 00:00")
+        self.time_label.setProperty("data-element-id", "progress-time-label")
+        self.time_label.setStyleSheet("color: #666666; font-size: 11px;")
+        layout.addWidget(self.time_label)
+
+        self.eta_label = QLabel("Remaining: --:--")
+        self.eta_label.setProperty("data-element-id", "progress-eta-label")
+        self.eta_label.setStyleSheet("color: #666666; font-size: 11px;")
+        layout.addWidget(self.eta_label)
+
         # Create progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setProperty("data-element-id", "progress-bar")
@@ -194,12 +205,41 @@ class ProgressWidget(QWidget):
         self._log_entry_counter = 0
         self.logger.info("Logs cleared")
 
+    def set_time_info(self, elapsed_seconds: float, estimated_remaining_seconds: float | None) -> None:
+        """Update the time information display.
+
+        Args:
+            elapsed_seconds: Elapsed time in seconds
+            estimated_remaining_seconds: Estimated remaining time in seconds, or None
+        """
+        self.time_label.setText(f"Elapsed: {self._format_time(elapsed_seconds)}")
+        if estimated_remaining_seconds is None:
+            self.eta_label.setText("Remaining: Calculating...")
+        else:
+            self.eta_label.setText(f"Remaining: {self._format_time(estimated_remaining_seconds)}")
+
+    def _format_time(self, seconds: float) -> str:
+        """Convert seconds to 'MM:SS' format.
+
+        Args:
+            seconds: Time in seconds
+
+        Returns:
+            Formatted time string (e.g., '02:05')
+        """
+        minutes = int(seconds) // 60
+        secs = int(seconds) % 60
+        return f"{minutes:02d}:{secs:02d}"
+
     def reset(self):
         """Reset the progress widget to initial state."""
         self.set_progress(0)
         self.set_state("PENDING")
+        self.time_label.setText("Elapsed: 00:00")
+        self.eta_label.setText("Remaining: --:--")
         self.clear_logs()
         self.hide_progress()
+        self.cancel_button.setEnabled(True)
         self.logger.info("Progress widget reset")
 
     def _scroll_to_bottom(self):

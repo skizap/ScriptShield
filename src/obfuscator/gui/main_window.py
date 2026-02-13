@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
     QGridLayout,
     QMainWindow,
     QMessageBox,
@@ -31,7 +32,7 @@ from obfuscator.gui.widgets import (
 from obfuscator.gui.styles.stylesheet import get_application_stylesheet
 from obfuscator.utils.logger import get_logger
 from obfuscator.utils.path_utils import get_platform, normalize_path
-from obfuscator.core.orchestrator import ObfuscationOrchestrator, JobState
+from obfuscator.core.orchestrator import ObfuscationOrchestrator, JobState, ErrorStrategy, ProgressInfo
 
 # Module-level logger
 logger = get_logger("obfuscator.gui.main_window")
@@ -70,6 +71,7 @@ class MainWindow(QMainWindow):
         self._setup_central_widget()
         self._connect_signals()
         self._center_window()
+        self._current_orchestrator: ObfuscationOrchestrator | None = None
 
         logger.info("MainWindow initialization complete")
 
@@ -259,39 +261,107 @@ class MainWindow(QMainWindow):
         input_files = [Path(f) for f in files]
         output_dir = Path(output_path) if output_path else Path.cwd() / "obfuscated"
 
-        # Define progress callback for GUI updates
-        def on_progress(message: str, current: int, total: int) -> None:
-            progress_percent = int((current / total) * 100) if total > 0 else 0
-            self.progress_widget.set_progress(progress_percent)
+        # Early conflict detection before creating main orchestrator
+        temp_orchestrator = ObfuscationOrchestrator()
+        conflict_result = temp_orchestrator.detect_conflicts(input_files, output_dir)
 
-            # Extract state from message format "State: {STATE_NAME} - {message}"
-            if message.startswith("State: "):
-                # Parse state prefix: "State: VALIDATING - Validating inputs..."
-                parts = message.split(" - ", 1)
-                if len(parts) == 2:
-                    state_part = parts[0]  # "State: VALIDATING"
-                    state_name = state_part.replace("State: ", "")  # "VALIDATING"
-                    actual_message = parts[1]  # "Validating inputs..."
-                    self.progress_widget.set_state(state_name)
-                    self.progress_widget.add_log_entry(actual_message, "info")
+        if conflict_result.has_conflicts:
+            from obfuscator.gui.widgets import ConflictResolutionDialog
+            dialog = ConflictResolutionDialog(conflict_result.conflicts, parent=self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                strategy = dialog.get_selected_strategy()
+                if strategy:
+                    temp_orchestrator.set_conflict_strategy(strategy)
+                    self.progress_widget.add_log_entry(
+                        f"Conflict resolution: {strategy.value}", "info"
+                    )
                 else:
-                    self.progress_widget.add_log_entry(message, "info")
+                    # User accepted but no strategy selected - cancel
+                    self.progress_widget.add_log_entry(
+                        "Obfuscation cancelled - no conflict resolution selected", "warning"
+                    )
+                    self.action_widget.set_enabled(True)
+                    return
             else:
-                self.progress_widget.add_log_entry(message, "info")
+                # User cancelled the dialog
+                self.progress_widget.add_log_entry(
+                    "Obfuscation cancelled by user", "warning"
+                )
+                self.action_widget.set_enabled(True)
+                return
+
+        # Define progress callback for GUI updates
+        def on_progress(progress_info: ProgressInfo) -> None:
+            self.progress_widget.set_progress(int(progress_info.percentage))
+            self.progress_widget.set_state(progress_info.current_state.name)
+            self.progress_widget.set_time_info(
+                progress_info.elapsed_seconds,
+                progress_info.estimated_remaining_seconds,
+            )
+            self.progress_widget.add_log_entry(progress_info.message, "info")
 
             # Process events to keep GUI responsive
             QApplication.processEvents()
 
+        # Define error callback for handling file processing errors
+        def on_error(file_path: Path, errors: list[str]) -> bool:
+            """Handle file processing error by showing error dialog to user.
+
+            Args:
+                file_path: Path to the file that failed processing
+                errors: List of error messages from the processing failure
+
+            Returns:
+                True to continue processing remaining files, False to stop
+            """
+            from obfuscator.gui.widgets import ErrorHandlingDialog
+            
+            dialog = ErrorHandlingDialog(file_path, errors, parent=self)
+            result = dialog.exec()
+            
+            # Get user decision
+            continue_processing = dialog.get_user_decision()
+            
+            # Log decision to progress widget
+            decision_msg = (
+                f"User chose to {'continue' if continue_processing else 'stop'} "
+                f"after error in {file_path.name}"
+            )
+            log_level = "info" if continue_processing else "warning"
+            self.progress_widget.add_log_entry(decision_msg, log_level)
+            
+            logger.info(f"Error handling decision for {file_path.name}: {decision_msg}")
+            
+            return continue_processing
+
         try:
-            # Create orchestrator and process files
+            # Create orchestrator and apply conflict strategy if set
             orchestrator = ObfuscationOrchestrator()
+            self._current_orchestrator = orchestrator
+            if conflict_result.has_conflicts:
+                # Copy the strategy from temp orchestrator
+                orchestrator.set_conflict_strategy(temp_orchestrator._conflict_strategy)
+
             result = orchestrator.process_files(
                 input_files=input_files,
                 output_dir=output_dir,
                 config=config,
-                progress_callback=on_progress
+                progress_callback=on_progress,
+                error_callback=on_error,
+                error_strategy=ErrorStrategy.ASK
             )
 
+            # Check for cancelled state
+            if result.current_state == JobState.CANCELLED:
+                completed_count = len(result.metadata.get("files_completed_before_cancel", []))
+                total_count = result.metadata.get("total_files_planned", 0)
+                self.progress_widget.add_log_entry("Obfuscation cancelled by user", "warning")
+                self.progress_widget.add_log_entry(
+                    f"Completed {completed_count}/{total_count} file(s) before cancellation", "info"
+                )
+                if result.warnings:
+                    for warning in result.warnings:
+                        self.progress_widget.add_log_entry(f"Warning: {warning}", "warning")
             # Report results
             # Always display errors first, regardless of success flag
             for error in result.errors:
@@ -305,12 +375,53 @@ class MainWindow(QMainWindow):
                     "success"
                 )
                 self.progress_widget.set_progress(100)
+
+                # Log conflict resolution info
+                skipped_count = len(result.metadata.get("skipped_files", []))
+                if skipped_count > 0:
+                    self.progress_widget.add_log_entry(
+                        f"{skipped_count} file(s) skipped due to conflicts", "warning"
+                    )
+                resolved_count = result.metadata.get("conflicts_resolved", 0)
+                if resolved_count > 0:
+                    self.progress_widget.add_log_entry(
+                        f"{resolved_count} file conflict(s) resolved", "info"
+                    )
+                
+                # Log error handling summary if errors were encountered
+                error_decisions = result.metadata.get("error_decisions", [])
+                if error_decisions:
+                    self.progress_widget.add_log_entry(
+                        f"{len(error_decisions)} error(s) encountered during processing", "warning"
+                    )
+                    # Display each failed file with first error message
+                    for decision in error_decisions:
+                        failed_file = decision.get("file", "Unknown")
+                        errors = decision.get("errors", [])
+                        first_error = errors[0] if errors else "Unknown error"
+                        self.progress_widget.add_log_entry(
+                            f"  - {failed_file}: {first_error}", "error"
+                        )
             else:
                 # Show a summary message for failures
                 self.progress_widget.add_log_entry(
                     "Obfuscation completed with errors. See error messages above.",
                     "error"
                 )
+                
+                # Log error handling summary even on failure
+                error_decisions = result.metadata.get("error_decisions", [])
+                if error_decisions:
+                    self.progress_widget.add_log_entry(
+                        f"{len(error_decisions)} error(s) encountered during processing", "warning"
+                    )
+                    for decision in error_decisions:
+                        failed_file = decision.get("file", "Unknown")
+                        errors = decision.get("errors", [])
+                        first_error = errors[0] if errors else "Unknown error"
+                        self.progress_widget.add_log_entry(
+                            f"  - {failed_file}: {first_error}", "error"
+                        )
 
             # Log warnings
             for warning in result.warnings:
@@ -324,14 +435,27 @@ class MainWindow(QMainWindow):
             # Re-enable start button
             has_files = len(self.file_selection.get_files()) > 0
             self.action_widget.set_enabled(has_files)
+            # Clear orchestrator reference
+            self._current_orchestrator = None
 
     def _on_cancel_obfuscation(self) -> None:
-        """Handle obfuscation cancellation."""
-        logger.info("Obfuscation cancelled")
-        self.progress_widget.hide_progress()
-        # Re-enable start button
-        has_files = len(self.file_selection.get_files()) > 0
-        self.action_widget.set_enabled(has_files)
+        """Handle obfuscation cancellation request from user."""
+        logger.info("Cancellation requested by user")
+
+        if self._current_orchestrator is not None:
+            # Notify the orchestrator to cancel
+            self._current_orchestrator.request_cancellation()
+            logger.info("Cancellation requested - orchestrator notified")
+            self.progress_widget.add_log_entry("Cancellation requested...", "warning")
+            # Disable the cancel button to prevent multiple clicks
+            self.progress_widget.cancel_button.setEnabled(False)
+        else:
+            # No active orchestrator, just hide the progress widget
+            logger.warning("No active orchestrator to cancel")
+            self.progress_widget.hide_progress()
+            # Re-enable start button
+            has_files = len(self.file_selection.get_files()) > 0
+            self.action_widget.set_enabled(has_files)
 
     def _on_profile_save(self) -> None:
         """

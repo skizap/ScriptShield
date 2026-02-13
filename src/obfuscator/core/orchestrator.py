@@ -4,23 +4,66 @@ This module provides the ObfuscationOrchestrator class that coordinates the
 complete obfuscation workflow: scanning files, building dependency graphs,
 pre-computing symbol tables, and processing files in topological order.
 
+The orchestrator implements a stateful workflow with the following phases:
+
+1. **Validation** (VALIDATING): Check file existence, readability, extensions,
+   output directory writability, and configuration validity.
+2. **Conflict Detection**: Scan output directory for existing files that would
+   be overwritten, and resolve via the configured ConflictStrategy.
+3. **Analysis** (ANALYZING): Parse files, extract symbols, build dependency
+   graph, and pre-compute global symbol table.
+4. **Processing** (PROCESSING): Obfuscate files in topological order with
+   progress tracking, error handling, and cancellation support.
+5. **Completion** (COMPLETED/FAILED/CANCELLED): Final state with metadata.
+
+State Transitions::
+
+    PENDING -> VALIDATING -> ANALYZING -> PROCESSING -> COMPLETED
+                  |                         |              |
+                  v                         v              v
+                FAILED                   CANCELLED       FAILED
+
 Example:
-    >>> from pathlib import Path
-    >>> from obfuscator.core.orchestrator import ObfuscationOrchestrator
-    >>> 
-    >>> orchestrator = ObfuscationOrchestrator()
-    >>> result = orchestrator.process_files(
-    ...     input_files=[Path("main.py"), Path("utils.py")],
-    ...     output_dir=Path("./obfuscated"),
-    ...     config={"identifier_prefix": "_0x", "mangling_strategy": "sequential"}
-    ... )
-    >>> if result.success:
-    ...     print(f"Processed {len(result.processed_files)} files")
+    Basic usage with progress tracking and error handling::
+
+        from pathlib import Path
+        from obfuscator.core.config import ObfuscationConfig
+        from obfuscator.core.orchestrator import (
+            ObfuscationOrchestrator, ErrorStrategy, ProgressInfo,
+        )
+
+        config = ObfuscationConfig(name="my_project", language="python")
+        orchestrator = ObfuscationOrchestrator(config=config)
+
+        def on_progress(info: ProgressInfo):
+            print(f"[{info.current_state.name}] {info.message} "
+                  f"({info.percentage:.0f}%) ETA: {info.formatted_remaining}")
+
+        def on_error(file_path, errors):
+            print(f"Error in {file_path}: {errors}")
+            return True  # continue processing
+
+        result = orchestrator.process_files(
+            input_files=[Path("main.py"), Path("utils.py")],
+            output_dir=Path("./obfuscated"),
+            config={"identifier_prefix": "_0x", "mangling_strategy": "sequential"},
+            progress_callback=on_progress,
+            error_callback=on_error,
+            error_strategy=ErrorStrategy.ASK,
+        )
+
+        if result.success:
+            print(f"Processed {len(result.processed_files)} files")
+            print(f"Total time: {result.metadata['total_processing_time_seconds']:.1f}s")
+        else:
+            print(f"Failed: {result.errors}")
 """
 
 from __future__ import annotations
 
 import os
+import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -72,6 +115,44 @@ class JobState(Enum):
     CANCELLED = "cancelled"
 
 
+class ErrorStrategy(Enum):
+    """Enumeration of error handling strategies during obfuscation.
+
+    When errors occur during file processing, these strategies determine
+    how the orchestrator handles the situation.
+
+    Strategies:
+        CONTINUE: Skip failed files and continue processing remaining files.
+                 Errors are logged but processing continues for other files.
+        STOP: Halt obfuscation immediately on first error.
+              No further files are processed after an error occurs.
+        ASK: Prompt user for decision (requires error callback).
+             The error_callback is invoked with file path and error messages.
+             User decides whether to continue or stop for each error.
+    """
+    CONTINUE = "continue"
+    STOP = "stop"
+    ASK = "ask"
+
+
+class ConflictStrategy(Enum):
+    """Enumeration of conflict resolution strategies for file output.
+
+    When output files already exist, these strategies determine how
+    the orchestrator handles the conflict.
+
+    Strategies:
+        OVERWRITE: Replace existing files without prompting
+        SKIP: Skip files that already exist
+        RENAME: Append timestamp to filename (e.g., `file_20260213_143022.py`)
+        ASK: Prompt user for each conflict (GUI only)
+    """
+    OVERWRITE = "overwrite"
+    SKIP = "skip"
+    RENAME = "rename"
+    ASK = "ask"
+
+
 @dataclass
 class ProcessedEngine:
     """Tracks an engine and its associated language for hybrid mode.
@@ -94,12 +175,14 @@ class ProcessResult:
         success: Whether processing succeeded
         errors: List of error messages
         warnings: List of warning messages
+        conflict_resolution: How conflict was resolved (e.g., "renamed", "skipped", "overwritten")
     """
     file_path: Path
     output_path: Path | None
     success: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    conflict_resolution: str | None = None
 
 
 @dataclass
@@ -140,26 +223,143 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ConflictInfo:
+    """Information about a single file conflict.
+    
+    Attributes:
+        input_path: Original input file path
+        output_path: Conflicting output file path
+        exists: Whether the file exists
+        is_writable: Whether the file is writable (if exists)
+    """
+    input_path: Path
+    output_path: Path
+    exists: bool
+    is_writable: bool = True
+
+
+@dataclass
+class ConflictDetectionResult:
+    """Result of conflict detection scan.
+    
+    Attributes:
+        conflicts: List of detected conflicts
+    """
+    conflicts: list[ConflictInfo] = field(default_factory=list)
+
+    @property
+    def has_conflicts(self) -> bool:
+        """Returns True if any conflicts were detected."""
+        return len(self.conflicts) > 0
+
+
+@dataclass
+class ProgressInfo:
+    """Encapsulates all progress-related information including time tracking.
+
+    Attributes:
+        current_file: Name of the file currently being processed, or None
+        current_index: Current step index in the processing sequence
+        total_files: Total number of steps in the processing sequence
+        percentage: Progress percentage (0.0 to 100.0)
+        elapsed_seconds: Elapsed time in seconds since processing started
+        estimated_remaining_seconds: Estimated remaining time in seconds, or None if unknown
+        current_state: Current JobState of the orchestration
+        message: Human-readable progress message
+    """
+    current_file: str | None
+    current_index: int
+    total_files: int
+    percentage: float
+    elapsed_seconds: float
+    estimated_remaining_seconds: float | None
+    current_state: JobState
+    message: str
+
+    @property
+    def is_complete(self) -> bool:
+        """Returns True when current_index >= total_files."""
+        return self.current_index >= self.total_files
+
+    @property
+    def formatted_elapsed(self) -> str:
+        """Returns elapsed time as 'MM:SS' format."""
+        minutes = int(self.elapsed_seconds) // 60
+        seconds = int(self.elapsed_seconds) % 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+    @property
+    def formatted_remaining(self) -> str:
+        """Returns estimated remaining time as 'MM:SS' format or 'Calculating...' if None."""
+        if self.estimated_remaining_seconds is None:
+            return "Calculating..."
+        minutes = int(self.estimated_remaining_seconds) // 60
+        seconds = int(self.estimated_remaining_seconds) % 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+
 class ObfuscationOrchestrator:
     """Coordinates the complete obfuscation workflow for multi-file projects.
 
-    The orchestrator implements a three-phase workflow:
-    1. Scan & Extract: Parse all files and extract symbols
-    2. Build Graph & Pre-compute: Build dependency graph and symbol table
-    3. Obfuscate: Process files in topological order
+    The orchestrator implements a stateful, multi-phase workflow:
+
+    1. **Validation** (VALIDATING): Pre-flight checks on inputs, config, and
+       output directory.
+    2. **Conflict Detection**: Identify and resolve output file conflicts using
+       the configured ``ConflictStrategy`` (OVERWRITE, SKIP, RENAME, ASK).
+    3. **Analysis** (ANALYZING): Scan files, extract symbols, build dependency
+       graph, and pre-compute global symbol table.
+    4. **Processing** (PROCESSING): Obfuscate files in topological order with
+       progress callbacks, error handling, and cancellation support.
+    5. **Completion**: Transition to COMPLETED, FAILED, or CANCELLED.
 
     Attributes:
         python_processor: Processor for Python files
         lua_processor: Processor for Lua files
         _logger: Logger instance
+        _current_state: Current ``JobState`` of the orchestrator
+        _cancellation_requested: Flag for graceful cancellation
+        _conflict_strategy: Active conflict resolution strategy
+        _error_strategy: Active error handling strategy
 
-    Example:
-        >>> orchestrator = ObfuscationOrchestrator()
-        >>> result = orchestrator.process_files(
-        ...     input_files=[Path("main.py")],
-        ...     output_dir=Path("./out"),
-        ...     config={"mangling_strategy": "sequential"}
-        ... )
+    Examples:
+        Simple usage without callbacks::
+
+            orchestrator = ObfuscationOrchestrator()
+            result = orchestrator.process_files(
+                input_files=[Path("main.py")],
+                output_dir=Path("./out"),
+                config={"mangling_strategy": "sequential"},
+            )
+
+        With progress tracking and cancellation::
+
+            orchestrator = ObfuscationOrchestrator(config=my_config)
+
+            def on_progress(info: ProgressInfo):
+                print(f"{info.percentage:.0f}% - {info.message}")
+
+            # Start in a thread to allow cancellation
+            result = orchestrator.process_files(
+                input_files=files,
+                output_dir=Path("./out"),
+                progress_callback=on_progress,
+            )
+            # From another thread: orchestrator.request_cancellation()
+
+        With error handling via ASK strategy::
+
+            def on_error(file_path, errors):
+                # Show dialog, return True to continue or False to stop
+                return True
+
+            result = orchestrator.process_files(
+                input_files=files,
+                output_dir=Path("./out"),
+                error_strategy=ErrorStrategy.ASK,
+                error_callback=on_error,
+            )
     """
 
     def __init__(self, config: ObfuscationConfig | None = None) -> None:
@@ -176,6 +376,23 @@ class ObfuscationOrchestrator:
         self._config = config
         self._processed_engines: list = []
         self._current_state: JobState = JobState.PENDING
+        # Initialize conflict strategy from config if provided, with safe fallback
+        if config is not None:
+            try:
+                self._conflict_strategy = ConflictStrategy(config.conflict_strategy)
+            except ValueError:
+                self._logger.warning(
+                    f"Invalid conflict_strategy '{config.conflict_strategy}' in config, "
+                    "falling back to ASK"
+                )
+                self._conflict_strategy = ConflictStrategy.ASK
+        else:
+            self._conflict_strategy = ConflictStrategy.ASK
+        self._conflict_decisions: dict[Path, str] = {}
+        self._cancellation_requested: bool = False
+        self._error_strategy: ErrorStrategy = ErrorStrategy.CONTINUE
+        self._start_time: float | None = None
+        self._file_processing_times: list[float] = []
 
     def _transition_state(self, new_state: JobState, result: OrchestrationResult) -> None:
         """Transition the orchestrator to a new state.
@@ -192,11 +409,69 @@ class ObfuscationOrchestrator:
         result.current_state = new_state
         self._logger.info(f"State transition: {old_state.name} -> {new_state.name}")
 
+    def request_cancellation(self) -> None:
+        """Request cancellation of the current obfuscation job.
+
+        Sets the cancellation flag which is checked at strategic points
+        during processing to allow graceful shutdown while preserving
+        partial results.
+
+        The flag is checked:
+        - Before the processing loop begins (immediate cancellation)
+        - At the start of each file iteration (between-file cancellation)
+
+        Files already written to disk are preserved.  The returned
+        ``OrchestrationResult`` will have ``current_state == CANCELLED``
+        and ``metadata["was_cancelled"] == True``, along with lists of
+        completed and skipped files.
+
+        This method is safe to call from any thread (e.g. a GUI cancel
+        button handler) and is idempotent.
+
+        Example::
+
+            # From a GUI thread while process_files() runs in a worker:
+            orchestrator.request_cancellation()
+        """
+        self._cancellation_requested = True
+        self._logger.info("Cancellation requested by user")
+
+    def _check_cancellation(self) -> bool:
+        """Check if cancellation has been requested.
+
+        Returns:
+            True if cancellation was requested, False otherwise.
+        """
+        if self._cancellation_requested:
+            self._logger.debug("Cancellation detected during processing")
+        return self._cancellation_requested
+
+    def _calculate_time_estimates(
+        self, total_input_files: int
+    ) -> tuple[float, float | None]:
+        """Calculate elapsed time and estimated remaining time.
+
+        Args:
+            total_input_files: Total number of input files to process
+
+        Returns:
+            Tuple of (elapsed_seconds, estimated_remaining_seconds or None)
+        """
+        if self._start_time is None:
+            return (0.0, None)
+        elapsed = time.time() - self._start_time
+        if not self._file_processing_times:
+            return (elapsed, None)
+        average_time = sum(self._file_processing_times) / len(self._file_processing_times)
+        files_remaining = max(0, total_input_files - len(self._file_processing_times))
+        estimated_remaining = average_time * files_remaining
+        return (elapsed, estimated_remaining)
+
     def orchestrate(
         self,
         input_files: list[str | Path],
         output_dir: str | Path,
-        progress_callback: Callable[[str, int, int], None] | None = None,
+        progress_callback: Callable[[ProgressInfo], None] | None = None,
         project_root: str | Path | None = None
     ) -> OrchestrationResult:
         """Orchestrate obfuscation using the stored ObfuscationConfig.
@@ -207,7 +482,7 @@ class ObfuscationOrchestrator:
         Args:
             input_files: List of input file paths (str or Path)
             output_dir: Output directory (str or Path)
-            progress_callback: Optional progress callback
+            progress_callback: Optional callback receiving ProgressInfo objects
             project_root: Optional project root directory
 
         Returns:
@@ -237,14 +512,36 @@ class ObfuscationOrchestrator:
         """Validate all inputs before processing begins.
         
         Performs comprehensive pre-flight checks including file existence,
-        readability, valid extensions, and output directory writability.
+        readability, valid extensions (.py, .pyw, .lua, .luau), output
+        directory writability, and ``ObfuscationConfig.validate()`` if a
+        config was provided at construction time.
         
         Args:
             input_files: List of input file paths to validate
             output_dir: Output directory to validate
             
         Returns:
-            ValidationResult with success flag and error/warning messages
+            ValidationResult with ``success`` flag and ``errors``/``warnings``
+            lists.  All detected issues are reported in a single result so
+            the caller can display them together.
+
+        Examples:
+            Successful validation::
+
+                result = orchestrator.validate_inputs([Path("main.py")], Path("./out"))
+                assert result.success
+                assert len(result.errors) == 0
+
+            Validation failure (nonexistent file + bad extension)::
+
+                result = orchestrator.validate_inputs(
+                    [Path("missing.py"), Path("notes.txt")],
+                    Path("./out"),
+                )
+                assert not result.success
+                # result.errors contains:
+                #   "File not found: missing.py"
+                #   "Unsupported file extension '.txt' for file: notes.txt. ..."
         """
         errors: list[str] = []
         warnings: list[str] = []
@@ -320,56 +617,363 @@ class ObfuscationOrchestrator:
             warnings=warnings
         )
 
+    def set_conflict_strategy(self, strategy: ConflictStrategy) -> None:
+        """Set the conflict resolution strategy.
+
+        Args:
+            strategy: The conflict resolution strategy to use
+        """
+        self._conflict_strategy = strategy
+        self._logger.info(f"Conflict strategy set to: {strategy.value}")
+
+    def handle_processing_error(
+        self,
+        file_path: Path,
+        errors: list[str],
+        error_callback: Callable[[Path, list[str]], bool] | None,
+    ) -> bool:
+        """Handle a file processing error based on the configured error strategy.
+
+        This method implements the error handling logic according to the
+        ErrorStrategy setting: CONTINUE, STOP, or ASK.
+
+        Args:
+            file_path: Path to the file that failed processing
+            errors: List of error messages from the processing failure
+            error_callback: Optional callback to invoke for user decision.
+                Required when error_strategy is ASK.
+                Signature: error_callback(file_path: Path, errors: list[str]) -> bool
+                Returns True to continue, False to stop.
+
+        Returns:
+            bool: True if processing should continue, False if it should stop
+
+        Raises:
+            ValueError: If error_strategy is ASK but no error_callback is provided
+
+        Example:
+            >>> should_continue = orchestrator.handle_processing_error(
+            ...     file_path=Path("main.py"),
+            ...     errors=["Parse error at line 10"],
+            ...     error_callback=my_callback
+            ... )
+        """
+        if self._error_strategy == ErrorStrategy.CONTINUE:
+            self._logger.warning(
+                f"Error processing {file_path.name}: {errors[0] if errors else 'Unknown error'}. "
+                "Continuing with remaining files (CONTINUE strategy)."
+            )
+            return True
+
+        elif self._error_strategy == ErrorStrategy.STOP:
+            self._logger.error(
+                f"Error processing {file_path.name}: {errors[0] if errors else 'Unknown error'}. "
+                "Halting obfuscation immediately (STOP strategy)."
+            )
+            return False
+
+        elif self._error_strategy == ErrorStrategy.ASK:
+            if error_callback is None:
+                raise ValueError(
+                    "ErrorStrategy.ASK requires an error_callback to be provided. "
+                    "Use ErrorStrategy.CONTINUE or ErrorStrategy.STOP, or provide a callback."
+                )
+            self._logger.info(
+                f"Error processing {file_path.name}. "
+                "Prompting user for decision (ASK strategy)."
+            )
+            decision = error_callback(file_path, errors)
+            action = "continue" if decision else "stop"
+            self._logger.info(f"User chose to {action} after error in {file_path.name}")
+            return decision
+
+        else:
+            self._logger.warning(
+                f"Unknown error strategy: {self._error_strategy}. "
+                "Defaulting to CONTINUE behavior."
+            )
+            return True
+
+    def detect_conflicts(
+        self,
+        input_files: list[Path],
+        output_dir: Path,
+        project_root: Path | None = None
+    ) -> ConflictDetectionResult:
+        """Detect file conflicts before processing begins.
+
+        For each input file, computes the expected output path and checks
+        if a file already exists at that location.
+
+        Args:
+            input_files: List of input file paths to check
+            output_dir: Output directory where files will be written
+            project_root: Optional project root for relative path computation.
+                         If None, computed from the common path of all input files.
+
+        Returns:
+            ``ConflictDetectionResult`` whose ``.has_conflicts`` property
+            indicates whether any conflicts exist, and ``.conflicts`` is a
+            list of ``ConflictInfo`` objects with ``input_path``,
+            ``output_path``, ``exists``, and ``is_writable`` fields.
+
+        Example::
+
+            result = orchestrator.detect_conflicts(files, Path("./out"), project_root)
+            if result.has_conflicts:
+                for c in result.conflicts:
+                    print(f"{c.output_path} already exists (writable={c.is_writable})")
+        """
+        conflicts: list[ConflictInfo] = []
+
+        # Compute project root if not provided
+        if project_root is None and input_files:
+            resolved_paths = [f.resolve() for f in input_files]
+            try:
+                common_path = Path(os.path.commonpath(resolved_paths))
+                project_root = common_path if common_path.is_dir() else common_path.parent
+            except ValueError:
+                project_root = Path.cwd()
+
+        for input_path in input_files:
+            # Compute output path using same logic as _process_file_in_order
+            if project_root:
+                try:
+                    relative_path = input_path.resolve().relative_to(project_root.resolve())
+                    output_path = output_dir / relative_path
+                except ValueError:
+                    output_path = output_dir / input_path.name
+            else:
+                output_path = output_dir / input_path.name
+
+            # Check if output file exists
+            exists = output_path.exists()
+            is_writable = True
+
+            if exists:
+                # Check if writable
+                is_writable = os.access(output_path, os.W_OK)
+                conflicts.append(ConflictInfo(
+                    input_path=input_path,
+                    output_path=output_path,
+                    exists=True,
+                    is_writable=is_writable
+                ))
+
+        if conflicts:
+            self._logger.info(f"Detected {len(conflicts)} file conflict(s)")
+        else:
+            self._logger.info("No file conflicts detected")
+
+        return ConflictDetectionResult(conflicts=conflicts)
+
+    def resolve_conflict(
+        self,
+        output_path: Path,
+        strategy: ConflictStrategy | None = None
+    ) -> Path | None:
+        """Resolve a file conflict using the specified strategy.
+
+        Args:
+            output_path: The path where the file would be written
+            strategy: The strategy to use. If None, uses ``self._conflict_strategy``.
+
+        Returns:
+            - **OVERWRITE**: Returns ``output_path`` unchanged.
+            - **SKIP**: Returns ``None`` (file should not be written).
+            - **RENAME**: Returns a new path with a ``_YYYYMMDD_HHMMSS``
+              timestamp suffix inserted before the extension.
+            - **ASK**: Returns the path based on a previously cached decision.
+
+        Raises:
+            ValueError: If ASK strategy is used and no cached decision exists.
+
+        Examples::
+
+            # OVERWRITE – returns same path
+            resolved = orchestrator.resolve_conflict(Path("out/main.py"))
+
+            # SKIP – returns None
+            orchestrator.set_conflict_strategy(ConflictStrategy.SKIP)
+            resolved = orchestrator.resolve_conflict(Path("out/main.py"))
+            assert resolved is None
+
+            # RENAME – returns timestamped path
+            orchestrator.set_conflict_strategy(ConflictStrategy.RENAME)
+            resolved = orchestrator.resolve_conflict(Path("out/main.py"))
+            # e.g. Path("out/main_20260213_143022.py")
+        """
+        effective_strategy = strategy if strategy is not None else self._conflict_strategy
+
+        if effective_strategy == ConflictStrategy.OVERWRITE:
+            self._logger.info(f"Resolved conflict for {output_path.name}: OVERWRITE")
+            return output_path
+
+        elif effective_strategy == ConflictStrategy.SKIP:
+            self._logger.info(f"Resolved conflict for {output_path.name}: SKIP")
+            return None
+
+        elif effective_strategy == ConflictStrategy.RENAME:
+            # Generate new path with timestamp suffix
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            # Insert timestamp before file extension
+            stem = output_path.stem
+            suffix = output_path.suffix
+            new_name = f"{stem}_{timestamp}{suffix}"
+            new_path = output_path.parent / new_name
+
+            # Handle edge case where renamed file also exists
+            counter = 1
+            while new_path.exists():
+                new_name = f"{stem}_{timestamp}_{counter}{suffix}"
+                new_path = output_path.parent / new_name
+                counter += 1
+
+            self._logger.info(f"Resolved conflict for {output_path.name}: RENAME -> {new_name}")
+            return new_path
+
+        elif effective_strategy == ConflictStrategy.ASK:
+            # Check for cached decision
+            if output_path in self._conflict_decisions:
+                decision = self._conflict_decisions[output_path]
+                if decision == "skip":
+                    self._logger.info(f"Resolved conflict for {output_path.name}: SKIP (cached)")
+                    return None
+                elif decision == "overwrite":
+                    self._logger.info(f"Resolved conflict for {output_path.name}: OVERWRITE (cached)")
+                    return output_path
+                elif decision.startswith("rename:"):
+                    new_path = Path(decision.replace("rename:", ""))
+                    self._logger.info(f"Resolved conflict for {output_path.name}: RENAME -> {new_path.name} (cached)")
+                    return new_path
+            else:
+                raise ValueError(
+                    f"ASK strategy requires cached decision for {output_path}. "
+                    "GUI must provide decision before calling resolve_conflict."
+                )
+
+        else:
+            self._logger.warning(f"Unknown conflict strategy: {effective_strategy}, defaulting to overwrite")
+            return output_path
+
     def process_files(
         self,
         input_files: list[Path],
         output_dir: Path,
         config: dict[str, Any] | None = None,
-        progress_callback: Callable[[str, int, int], None] | None = None,
-        project_root: Path | None = None
+        progress_callback: Callable[[ProgressInfo], None] | None = None,
+        project_root: Path | None = None,
+        error_callback: Callable[[Path, list[str]], bool] | None = None,
+        error_strategy: ErrorStrategy = ErrorStrategy.CONTINUE,
     ) -> OrchestrationResult:
         """Process multiple files with dependency-aware obfuscation.
 
-        This is the main entry point for the orchestration workflow.
+        This is the main entry point for the orchestration workflow.  It drives
+        the orchestrator through the following state transitions::
+
+            PENDING -> VALIDATING -> ANALYZING -> PROCESSING -> COMPLETED
+                          |                         |
+                          v                         v
+                        FAILED                   CANCELLED
+
+        The ``progress_callback`` receives a ``ProgressInfo`` object at each
+        major step (validation, conflict check, scanning, graph build, symbol
+        table build, and once per file).  ``ProgressInfo`` includes
+        ``current_state``, ``percentage``, ``elapsed_seconds``,
+        ``estimated_remaining_seconds``, and a human-readable ``message``.
+
+        Cancellation can be requested at any time via
+        ``request_cancellation()``.  The flag is checked before the processing
+        loop and at the start of each file iteration.  Already-written files
+        are preserved; the result includes metadata about which files were
+        completed and which were skipped.
 
         Args:
             input_files: List of input file paths to process
             output_dir: Directory to write obfuscated files
             config: Configuration options for obfuscation
-            progress_callback: Optional callback for progress updates
-                Signature: callback(message: str, current: int, total: int)
+            progress_callback: Optional callback for progress updates.
+                Signature: ``callback(progress_info: ProgressInfo)``
             project_root: Explicit project root directory for import resolution.
                 If None, computed from the common path of all input files.
+            error_callback: Optional callback for handling file processing errors.
+                Signature: ``error_callback(file_path: Path, errors: list[str]) -> bool``
+                Returns True to continue processing, False to stop.
+                Required when error_strategy is ASK.
+            error_strategy: Strategy for handling file processing errors.
+                - ``CONTINUE``: Skip failed files and continue.
+                - ``STOP``: Halt on first error.
+                - ``ASK``: Prompt user via error_callback for each error.
 
         Returns:
-            OrchestrationResult with processing details
+            OrchestrationResult with ``success``, ``current_state``,
+            ``processed_files``, ``errors``, ``warnings``, and ``metadata``
+            (including ``total_processing_time_seconds``,
+            ``average_time_per_file_seconds``, ``was_cancelled``, etc.).
 
-        Example:
-            >>> def on_progress(msg, current, total):
-            ...     print(f"{msg} ({current}/{total})")
-            >>> result = orchestrator.process_files(
-            ...     input_files=[Path("main.py")],
-            ...     output_dir=Path("./out"),
-            ...     progress_callback=on_progress,
-            ...     project_root=Path("/path/to/project")
-            ... )
+        Examples:
+            With progress and error callbacks::
+
+                def on_progress(info: ProgressInfo):
+                    print(f"{info.message} ({info.percentage:.0f}%)")
+
+                def on_error(file_path, errors):
+                    return True  # continue
+
+                result = orchestrator.process_files(
+                    input_files=[Path("main.py")],
+                    output_dir=Path("./out"),
+                    progress_callback=on_progress,
+                    error_callback=on_error,
+                    error_strategy=ErrorStrategy.ASK,
+                    project_root=Path("/path/to/project"),
+                )
         """
         config = config or {}
         self._processed_engines = []
+        self._cancellation_requested = False  # Reset cancellation flag
+        self._error_strategy = error_strategy  # Store error strategy
+        self._start_time = time.time()
+        self._file_processing_times = []
         result = OrchestrationResult(success=True)
-        total_steps = len(input_files) + 4  # validation + scan + build + pre-compute + one per file
+        # 5 pre-file phases: validation, conflict detection, scanning,
+        # dependency build, symbol-table build — plus one step per file
+        total_steps = 5 + len(input_files)
         current_step = 0
+        num_input_files = len(input_files)
 
         # Initialize state to PENDING
         self._transition_state(JobState.PENDING, result)
 
-        def report_progress(message: str) -> None:
+        def _build_progress_info(message: str, current_file: str | None = None) -> ProgressInfo:
+            elapsed, estimated_remaining = self._calculate_time_estimates(num_input_files)
+            percentage = (current_step / total_steps) * 100 if total_steps > 0 else 0
+            return ProgressInfo(
+                current_file=current_file,
+                current_index=current_step,
+                total_files=total_steps,
+                percentage=percentage,
+                elapsed_seconds=elapsed,
+                estimated_remaining_seconds=estimated_remaining,
+                current_state=self._current_state,
+                message=message,
+            )
+
+        def report_progress(message: str, current_file: str | None = None) -> None:
+            """Report a progress step (increments the step counter)."""
             nonlocal current_step
             current_step += 1
-            state_prefix = f"State: {self._current_state.name} - "
-            full_message = state_prefix + message
+            progress_info = _build_progress_info(message, current_file)
             if progress_callback:
-                progress_callback(full_message, current_step, total_steps)
+                progress_callback(progress_info)
+            self._logger.info(message)
+
+        def emit_log(message: str, current_file: str | None = None) -> None:
+            """Emit a log-only message without incrementing the step counter."""
+            progress_info = _build_progress_info(message, current_file)
+            if progress_callback:
+                progress_callback(progress_info)
             self._logger.info(message)
 
         # Transition to VALIDATING and validate inputs before processing
@@ -389,6 +993,46 @@ class ObfuscationOrchestrator:
         # Add any validation warnings to result
         if validation_result.warnings:
             result.warnings.extend(validation_result.warnings)
+
+        # Conflict detection after validation succeeds
+        report_progress("Checking for file conflicts...")
+        conflict_result = self.detect_conflicts(input_files, output_dir, project_root)
+
+        if conflict_result.has_conflicts:
+            conflict_count = len(conflict_result.conflicts)
+
+            if self._conflict_strategy == ConflictStrategy.ASK:
+                # Return early with conflicts info for GUI to handle
+                result.success = False
+                result.errors.append(
+                    "File conflicts detected. Please resolve conflicts before proceeding."
+                )
+                result.metadata["conflicts"] = conflict_result.conflicts
+                result.metadata["conflicts_detected"] = conflict_count
+                result.metadata["conflict_strategy"] = self._conflict_strategy.value
+                self._logger.warning(
+                    f"Detected {conflict_count} file conflict(s) - returning for GUI resolution"
+                )
+                self._transition_state(JobState.FAILED, result)
+                return result
+
+            elif self._conflict_strategy == ConflictStrategy.SKIP:
+                result.warnings.append(
+                    f"{conflict_count} file(s) will be skipped due to conflicts"
+                )
+                self._logger.info(f"{conflict_count} file(s) will be skipped")
+
+            elif self._conflict_strategy == ConflictStrategy.RENAME:
+                result.warnings.append(
+                    f"{conflict_count} file(s) will be renamed to avoid conflicts"
+                )
+                self._logger.info(f"{conflict_count} file(s) will be renamed")
+
+            elif self._conflict_strategy == ConflictStrategy.OVERWRITE:
+                result.warnings.append(
+                    f"{conflict_count} existing file(s) will be overwritten"
+                )
+                self._logger.info(f"{conflict_count} existing file(s) will be overwritten")
 
         # Compute project root from all input files if not explicitly provided
         if project_root is None and input_files:
@@ -455,22 +1099,108 @@ class ObfuscationOrchestrator:
             # Transition to PROCESSING before file processing loop
             self._transition_state(JobState.PROCESSING, result)
 
+            # Check for cancellation before starting the loop
+            if self._check_cancellation():
+                self._transition_state(JobState.CANCELLED, result)
+                result.success = False
+                cancel_total_time = time.time() - self._start_time
+                result.metadata["cancellation_message"] = "Job cancelled by user before processing began"
+                result.metadata["cancellation_time"] = datetime.now().isoformat()
+                result.metadata["was_cancelled"] = True
+                result.metadata["total_files_planned"] = len(processing_order)
+                result.metadata["files_completed_before_cancel"] = []
+                result.metadata["files_skipped_due_to_cancel"] = list(processing_order)
+                result.metadata["total_processing_time_seconds"] = cancel_total_time
+                result.metadata["average_time_per_file_seconds"] = 0
+                result.metadata["individual_file_times"] = []
+                result.metadata["processing_start_time"] = datetime.fromtimestamp(self._start_time).isoformat()
+                result.metadata["processing_end_time"] = datetime.now().isoformat()
+                result.warnings.append(f"0 of {len(processing_order)} file(s) completed before cancellation")
+                emit_log("Job cancelled by user")
+                return result
+
             for file_path in processing_order:
+                # Check for cancellation at the start of each iteration
+                if self._check_cancellation():
+                    self._transition_state(JobState.CANCELLED, result)
+                    result.success = False
+                    cancel_total_time = time.time() - self._start_time
+                    result.metadata["cancellation_message"] = "Job cancelled by user during processing"
+                    result.metadata["cancellation_time"] = datetime.now().isoformat()
+                    result.metadata["was_cancelled"] = True
+                    result.metadata["total_files_planned"] = len(processing_order)
+                    completed_files = [pr.file_path for pr in result.processed_files if pr.success]
+                    result.metadata["files_completed_before_cancel"] = [str(f) for f in completed_files]
+                    skipped_files = [f for f in processing_order if f not in completed_files]
+                    result.metadata["files_skipped_due_to_cancel"] = [str(f) for f in skipped_files]
+                    result.metadata["total_processing_time_seconds"] = cancel_total_time
+                    result.metadata["average_time_per_file_seconds"] = (
+                        sum(self._file_processing_times) / len(self._file_processing_times)
+                        if self._file_processing_times else 0
+                    )
+                    result.metadata["individual_file_times"] = self._file_processing_times
+                    result.metadata["processing_start_time"] = datetime.fromtimestamp(self._start_time).isoformat()
+                    result.metadata["processing_end_time"] = datetime.now().isoformat()
+                    result.warnings.append(f"{len(completed_files)} of {len(processing_order)} file(s) completed before cancellation")
+                    emit_log("Job cancelled by user")
+                    return result
+
                 if file_path not in successfully_parsed:
                     continue
 
-                report_progress(f"Processing {file_path.name}...")
+                report_progress(f"Processing {file_path.name}...", current_file=file_path.name)
                 # Re-parse file just-in-time (AST not cached)
+                file_start_time = time.time()
                 process_result = self._process_file_in_order(
                     file_path,
                     global_table,
                     output_dir,
                     config
                 )
+                self._file_processing_times.append(time.time() - file_start_time)
                 result.processed_files.append(process_result)
 
                 if not process_result.success:
-                    result.warnings.extend(process_result.errors)
+                    # Append all per-file errors to the orchestration result
+                    result.errors.extend(process_result.errors)
+
+                    # Report all error messages via progress callback
+                    if process_result.errors:
+                        joined_errors = "; ".join(process_result.errors)
+                        error_msg = f"Error processing {file_path.name}: {joined_errors}"
+                    else:
+                        error_msg = f"Error processing {file_path.name}: Unknown error"
+                    emit_log(error_msg, current_file=file_path.name)
+                    
+                    # Handle error based on strategy
+                    should_continue = self.handle_processing_error(
+                        file_path,
+                        process_result.errors,
+                        error_callback
+                    )
+                    
+                    # Track error decision in metadata
+                    if "error_decisions" not in result.metadata:
+                        result.metadata["error_decisions"] = []
+                    if "files_failed_with_errors" not in result.metadata:
+                        result.metadata["files_failed_with_errors"] = []
+                    
+                    decision = "continue" if should_continue else "stop"
+                    result.metadata["error_decisions"].append({
+                        "file": str(file_path),
+                        "errors": process_result.errors,
+                        "decision": decision
+                    })
+                    result.metadata["files_failed_with_errors"].append(str(file_path))
+                    
+                    # Report user decision
+                    emit_log(f"User chose to {decision} after error", current_file=file_path.name)
+                    
+                    # Break loop if user chose to stop
+                    if not should_continue:
+                        self._transition_state(JobState.FAILED, result)
+                        result.success = False
+                        break
 
             # Update overall success based on individual results
             failed_count = sum(
@@ -481,15 +1211,46 @@ class ObfuscationOrchestrator:
                     f"{failed_count} file(s) had processing errors"
                 )
 
+            # Calculate total processing time
+            total_time = time.time() - self._start_time
+
             result.metadata["total_files"] = len(input_files)
             result.metadata["processed_files"] = len(result.processed_files)
             result.metadata["failed_files"] = failed_count
             result.metadata["runtime_mode"] = self._config.runtime_mode if self._config else "embedded"
             result.metadata["runtime_files"] = []
+            result.metadata["conflict_strategy"] = self._conflict_strategy.value
+            result.metadata["error_strategy"] = self._error_strategy.value
+            result.metadata["was_cancelled"] = self._cancellation_requested
+            result.metadata["total_processing_time_seconds"] = total_time
+            result.metadata["average_time_per_file_seconds"] = (
+                sum(self._file_processing_times) / len(self._file_processing_times)
+                if self._file_processing_times else 0
+            )
+            result.metadata["individual_file_times"] = self._file_processing_times
+            result.metadata["processing_start_time"] = datetime.fromtimestamp(self._start_time).isoformat()
+            result.metadata["processing_end_time"] = datetime.now().isoformat()
 
-            # Transition to COMPLETED after successful processing
-            self._transition_state(JobState.COMPLETED, result)
-            report_progress("Job completed")
+            # Track skipped files and conflict resolutions
+            skipped_files = [
+                pr.file_path for pr in result.processed_files
+                if pr.conflict_resolution == "skipped"
+            ]
+            if skipped_files:
+                result.metadata["skipped_files"] = [str(f) for f in skipped_files]
+
+            # Track resolved conflicts
+            resolved_conflicts = [
+                pr for pr in result.processed_files
+                if pr.conflict_resolution in ("renamed", "overwritten")
+            ]
+            if resolved_conflicts:
+                result.metadata["conflicts_resolved"] = len(resolved_conflicts)
+
+            # Transition to COMPLETED only if the job didn't fail (e.g. stop-on-error)
+            if result.success and result.current_state != JobState.FAILED:
+                self._transition_state(JobState.COMPLETED, result)
+                emit_log("Job completed")
 
             # Generate hybrid runtime files if in hybrid mode
             if self._config is not None and self._config.runtime_mode == "hybrid":
@@ -501,7 +1262,7 @@ class ObfuscationOrchestrator:
             self._logger.error(f"Orchestration failed: {e}", exc_info=True)
             # Transition to FAILED on exception
             self._transition_state(JobState.FAILED, result)
-            report_progress("Job failed")
+            emit_log("Job failed")
 
         return result
 
@@ -786,12 +1547,22 @@ class ObfuscationOrchestrator:
                         final_code = self._inject_embedded_runtime(
                             gen_result.code, "python", used_engine
                         )
-                        self._write_output(output_path, final_code)
+                        actual_path, conflict_res = self._write_output(output_path, final_code)
+                        if actual_path is None:
+                            # File was skipped
+                            return ProcessResult(
+                                file_path=file_path,
+                                output_path=None,
+                                success=True,
+                                warnings=[f"Skipped {file_path.name} - file exists at output path"],
+                                conflict_resolution=conflict_res
+                            )
                         return ProcessResult(
                             file_path=file_path,
-                            output_path=output_path,
+                            output_path=actual_path,
                             success=True,
-                            warnings=[]
+                            warnings=[],
+                            conflict_resolution=conflict_res
                         )
                     else:
                         return ProcessResult(
@@ -845,12 +1616,22 @@ class ObfuscationOrchestrator:
                     final_code = self._inject_embedded_runtime(
                         transform_result["code"], "lua", used_engine
                     )
-                    self._write_output(output_path, final_code)
+                    actual_path, conflict_res = self._write_output(output_path, final_code)
+                    if actual_path is None:
+                        # File was skipped
+                        return ProcessResult(
+                            file_path=file_path,
+                            output_path=None,
+                            success=True,
+                            warnings=[f"Skipped {file_path.name} - file exists at output path"],
+                            conflict_resolution=conflict_res
+                        )
                     return ProcessResult(
                         file_path=file_path,
-                        output_path=output_path,
+                        output_path=actual_path,
                         success=True,
-                        warnings=[]
+                        warnings=[],
+                        conflict_resolution=conflict_res
                     )
                 else:
                     return ProcessResult(
@@ -1180,16 +1961,44 @@ class ObfuscationOrchestrator:
             self._logger.warning(f"Failed to generate hybrid runtime files: {e}")
             # Don't fail the entire orchestration - log and continue
 
-    def _write_output(self, output_path: Path, code: str) -> None:
-        """Write obfuscated code to output file.
+    def _write_output(self, output_path: Path, code: str) -> tuple[Path | None, str | None]:
+        """Write obfuscated code to output file with conflict resolution.
 
         Args:
             output_path: Path to write to
             code: Obfuscated code content
+
+        Returns:
+            Tuple of (resolved_path, conflict_resolution) where:
+            - resolved_path: The path actually written to (None if skipped)
+            - conflict_resolution: How the conflict was resolved (None if no conflict)
         """
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(code, encoding="utf-8")
-        self._logger.debug(f"Wrote output to {output_path}")
+        resolved_path = output_path
+        conflict_resolution = None
+
+        # Check for conflicts if file exists and strategy is not OVERWRITE
+        if output_path.exists() and self._conflict_strategy != ConflictStrategy.OVERWRITE:
+            resolved_path = self.resolve_conflict(output_path)
+
+            if resolved_path is None:
+                # SKIP strategy - don't write
+                self._logger.info(f"Skipped writing {output_path.name} (file exists)")
+                return None, "skipped"
+
+            # If path changed, it was renamed
+            if resolved_path != output_path:
+                conflict_resolution = "renamed"
+            else:
+                conflict_resolution = "overwritten"
+        elif output_path.exists() and self._conflict_strategy == ConflictStrategy.OVERWRITE:
+            conflict_resolution = "overwritten"
+
+        # Create parent directories and write file
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path.write_text(code, encoding="utf-8")
+        self._logger.debug(f"Wrote output to {resolved_path}")
+
+        return resolved_path, conflict_resolution
 
     def _detect_language(self, file_path: Path) -> str:
         """Detect the language of a file based on extension.
