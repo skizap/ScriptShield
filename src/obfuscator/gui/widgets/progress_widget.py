@@ -1,5 +1,7 @@
 """Progress widget for displaying obfuscation progress and logs."""
 
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -64,6 +66,17 @@ class ProgressWidget(QWidget):
         self.eta_label.setProperty("data-element-id", "progress-eta-label")
         self.eta_label.setStyleSheet("color: #666666; font-size: 11px;")
         layout.addWidget(self.eta_label)
+
+        self.current_file_label = QLabel("Current: --")
+        self.current_file_label.setProperty("data-element-id", "progress-current-file-label")
+        self.current_file_label.setStyleSheet(get_widget_style("current_file_label"))
+        layout.addWidget(self.current_file_label)
+
+        self.batch_label = QLabel("")
+        self.batch_label.setProperty("data-element-id", "progress-batch-label")
+        self.batch_label.setStyleSheet(get_widget_style("batch_progress_label"))
+        layout.addWidget(self.batch_label)
+        self.batch_label.setVisible(False)
 
         # Create progress bar
         self.progress_bar = QProgressBar()
@@ -166,9 +179,17 @@ class ProgressWidget(QWidget):
         """Add a log entry to the log container."""
         from datetime import datetime
 
+        icon_map = {
+            "success": "✓",
+            "warning": "⚠",
+            "error": "✗",
+            "info": "",
+        }
+        icon = icon_map.get(level, "")
+
         # Create timestamp
         timestamp = datetime.now().strftime("%H:%M:%S")
-        full_message = f"[{timestamp}] {message}"
+        full_message = f"[{timestamp}] {icon} {message}".strip()
 
         # Create label
         log_label = QLabel(full_message)
@@ -218,6 +239,29 @@ class ProgressWidget(QWidget):
         else:
             self.eta_label.setText(f"Remaining: {self._format_time(estimated_remaining_seconds)}")
 
+    def set_current_file(self, filename: str | None) -> None:
+        """Update the current file display."""
+        if not filename:
+            display_filename = "--"
+        else:
+            display_filename = filename
+            if "/" in filename or "\\" in filename:
+                display_filename = Path(filename.replace("\\", "/")).name
+
+        self.current_file_label.setText(f"Current: {display_filename}")
+        self.logger.debug(f"Current file updated: {display_filename}")
+
+    def set_batch_info(self, current_batch: int, total_batches: int) -> None:
+        """Update the batch progress display."""
+        if total_batches <= 1:
+            self.batch_label.setText("")
+            self.batch_label.setVisible(False)
+        else:
+            self.batch_label.setVisible(True)
+            self.batch_label.setText(f"Processing batch {current_batch} of {total_batches}")
+
+        self.logger.debug(f"Batch info updated: batch {current_batch} of {total_batches}")
+
     def _format_time(self, seconds: float) -> str:
         """Convert seconds to 'MM:SS' format.
 
@@ -237,6 +281,9 @@ class ProgressWidget(QWidget):
         self.set_state("PENDING")
         self.time_label.setText("Elapsed: 00:00")
         self.eta_label.setText("Remaining: --:--")
+        self.current_file_label.setText("Current: --")
+        self.batch_label.setText("")
+        self.batch_label.setVisible(False)
         self.clear_logs()
         self.hide_progress()
         self.cancel_button.setEnabled(True)

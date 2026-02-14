@@ -1,115 +1,121 @@
-"""Python and Lua source code processing module.
+"""Public API for source processors with lazy imports.
 
-This module provides the processors package for parsing source files
-into Abstract Syntax Trees (AST), generating code from AST nodes, extracting
-symbol information for dependency analysis, applying AST transformations
-for code obfuscation, and detecting unsupported features.
-
-Classes:
-    PythonProcessor: Main processor class for parsing, code generation, and transformations
-    SymbolExtractor: AST visitor for extracting symbol information
-    ASTTransformer: Base class for AST transformations
-    ConstantFoldingTransformer: Example transformer for constant folding
-    UnsupportedFeatureDetector: Detector for unsupported or problematic Python features
-    LuaProcessor: Main processor class for Lua parsing and code generation
-    LuaSymbolExtractor: AST visitor for extracting Lua symbol information
-    LuaFeatureDetector: Detector for unsupported or problematic Lua features
-
-Data Classes:
-    SymbolTable: Complete symbol information for a Python file
-    ImportInfo: Information about an import statement
-    FunctionInfo: Information about a function definition
-    ClassInfo: Information about a class definition
-    VariableInfo: Information about a variable assignment
-    TransformResult: Result of applying a single AST transformer
-    TransformationPipelineResult: Result of applying multiple transformers
-    FeatureWarning: Warning about an unsupported or problematic feature
-    LuaSymbolTable: Complete symbol information for a Lua file
-    LuaImportInfo: Information about a Lua require() call
-    LuaFunctionInfo: Information about a Lua function definition
-    LuaVariableInfo: Information about a Lua variable assignment
-    LuaParseResult: Result of parsing a Lua source file
-    LuaGenerateResult: Result of generating Lua code from an AST
-
-Example:
-    >>> from obfuscator.processors import PythonProcessor
-    >>> processor = PythonProcessor()
-    >>> result = processor.parse_file("example.py")
-    >>> if result.success:
-    ...     # Generate code
-    ...     generated = processor.generate_code(result.ast_node)
-    ...     # Extract symbols
-    ...     symbols = processor.extract_symbols(result.ast_node, result.file_path)
-    ...     print(f"Found {len(symbols.functions)} functions")
-    ...     # Apply transformations
-    ...     from obfuscator.processors import ConstantFoldingTransformer
-    ...     transformers = [ConstantFoldingTransformer()]
-    ...     transform_result = processor.apply_transformations(
-    ...         result.ast_node, transformers
-    ...     )
-    ...     # Check for warnings
-    ...     for warning in result.warnings:
-    ...         print(f"Warning: {warning.feature_name} at line {warning.line_number}")
+This package intentionally avoids eager imports of heavy processor modules to
+reduce startup overhead and prevent circular-import chains during module
+initialization (for example, when only runtime helpers are needed).
 """
 
-from obfuscator.processors.ast_transformer import (
-    ASTTransformer,
-    ConstantFoldingTransformer,
-    SelfModifyingCodeTransformer,
-    TransformResult,
-)
-from obfuscator.processors.feature_detector import (
-    FeatureWarning,
-    UnsupportedFeatureDetector,
-)
-from obfuscator.processors.lua_feature_detector import LuaFeatureDetector
-from obfuscator.processors.lua_processor import (
-    LuaProcessor,
-    ParseResult as LuaParseResult,
-    GenerateResult as LuaGenerateResult,
-)
-from obfuscator.processors.lua_symbol_extractor import (
-    LuaSymbolExtractor,
-    LuaSymbolTable,
-    LuaImportInfo,
-    LuaFunctionInfo,
-    LuaVariableInfo,
-)
-from obfuscator.processors.python_processor import (
-    TransformationPipelineResult,
-    PythonProcessor,
-)
-from obfuscator.processors.symbol_extractor import (
-    ClassInfo,
-    FunctionInfo,
-    ImportInfo,
-    SymbolExtractor,
-    SymbolTable,
-    VariableInfo,
-)
+from __future__ import annotations
 
-__all__ = [
-    "PythonProcessor",
-    "SymbolExtractor",
-    "SymbolTable",
-    "ImportInfo",
-    "FunctionInfo",
-    "ClassInfo",
-    "VariableInfo",
-    "ASTTransformer",
-    "TransformResult",
-    "ConstantFoldingTransformer",
-    "SelfModifyingCodeTransformer",
-    "TransformationPipelineResult",
-    "UnsupportedFeatureDetector",
-    "LuaProcessor",
-    "LuaParseResult",
-    "LuaGenerateResult",
-    "LuaSymbolExtractor",
-    "LuaSymbolTable",
-    "LuaImportInfo",
-    "LuaFunctionInfo",
-    "LuaVariableInfo",
-    "LuaFeatureDetector",
-    "FeatureWarning",
-]
+from importlib import import_module
+from typing import Any
+
+_EXPORT_MAP: dict[str, tuple[str, str]] = {
+    "PythonProcessor": (
+        "obfuscator.processors.python_processor",
+        "PythonProcessor",
+    ),
+    "TransformationPipelineResult": (
+        "obfuscator.processors.python_processor",
+        "TransformationPipelineResult",
+    ),
+    "SymbolExtractor": (
+        "obfuscator.processors.symbol_extractor",
+        "SymbolExtractor",
+    ),
+    "SymbolTable": (
+        "obfuscator.processors.symbol_extractor",
+        "SymbolTable",
+    ),
+    "ImportInfo": (
+        "obfuscator.processors.symbol_extractor",
+        "ImportInfo",
+    ),
+    "FunctionInfo": (
+        "obfuscator.processors.symbol_extractor",
+        "FunctionInfo",
+    ),
+    "ClassInfo": (
+        "obfuscator.processors.symbol_extractor",
+        "ClassInfo",
+    ),
+    "VariableInfo": (
+        "obfuscator.processors.symbol_extractor",
+        "VariableInfo",
+    ),
+    "ASTTransformer": (
+        "obfuscator.processors.ast_transformer",
+        "ASTTransformer",
+    ),
+    "TransformResult": (
+        "obfuscator.processors.ast_transformer",
+        "TransformResult",
+    ),
+    "ConstantFoldingTransformer": (
+        "obfuscator.processors.ast_transformer",
+        "ConstantFoldingTransformer",
+    ),
+    "SelfModifyingCodeTransformer": (
+        "obfuscator.processors.ast_transformer",
+        "SelfModifyingCodeTransformer",
+    ),
+    "UnsupportedFeatureDetector": (
+        "obfuscator.processors.feature_detector",
+        "UnsupportedFeatureDetector",
+    ),
+    "FeatureWarning": (
+        "obfuscator.processors.feature_detector",
+        "FeatureWarning",
+    ),
+    "LuaProcessor": (
+        "obfuscator.processors.lua_processor",
+        "LuaProcessor",
+    ),
+    "LuaParseResult": (
+        "obfuscator.processors.lua_processor",
+        "ParseResult",
+    ),
+    "LuaGenerateResult": (
+        "obfuscator.processors.lua_processor",
+        "GenerateResult",
+    ),
+    "LuaSymbolExtractor": (
+        "obfuscator.processors.lua_symbol_extractor",
+        "LuaSymbolExtractor",
+    ),
+    "LuaSymbolTable": (
+        "obfuscator.processors.lua_symbol_extractor",
+        "LuaSymbolTable",
+    ),
+    "LuaImportInfo": (
+        "obfuscator.processors.lua_symbol_extractor",
+        "LuaImportInfo",
+    ),
+    "LuaFunctionInfo": (
+        "obfuscator.processors.lua_symbol_extractor",
+        "LuaFunctionInfo",
+    ),
+    "LuaVariableInfo": (
+        "obfuscator.processors.lua_symbol_extractor",
+        "LuaVariableInfo",
+    ),
+    "LuaFeatureDetector": (
+        "obfuscator.processors.lua_feature_detector",
+        "LuaFeatureDetector",
+    ),
+}
+
+__all__ = list(_EXPORT_MAP.keys())
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve package exports lazily."""
+    target = _EXPORT_MAP.get(name)
+    if target is None:
+        raise AttributeError(f"module 'obfuscator.processors' has no attribute {name!r}")
+
+    module_name, attr_name = target
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

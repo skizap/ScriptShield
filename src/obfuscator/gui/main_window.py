@@ -298,7 +298,10 @@ class MainWindow(QMainWindow):
                 progress_info.elapsed_seconds,
                 progress_info.estimated_remaining_seconds,
             )
-            self.progress_widget.add_log_entry(progress_info.message, "info")
+            self.progress_widget.add_log_entry(
+                progress_info.message,
+                progress_info.log_level or "info",
+            )
 
             # Process events to keep GUI responsive
             QApplication.processEvents()

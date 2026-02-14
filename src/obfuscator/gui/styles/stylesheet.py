@@ -373,11 +373,27 @@ STYLES = {
     "log_entry_warning": f"color: {COLORS['warning']}; font-family: monospace; font-size: 11px; padding: 2px;",
     "log_entry_error": f"color: {COLORS['error']}; font-family: monospace; font-size: 11px; padding: 2px;",
     "log_entry_info": "color: white; font-family: monospace; font-size: 11px; padding: 2px;",
+    "current_file_label": f"""
+        QLabel {{
+            color: {COLORS['text_secondary']};
+            font-size: {FONTS['size_small']};
+            font-family: monospace;
+            padding: 2px 0px;
+        }}
+    """,
+    "batch_progress_label": f"""
+        QLabel {{
+            color: {COLORS['primary']};
+            font-size: {FONTS['size_small']};
+            font-weight: {FONTS['weight_bold']};
+            padding: 2px 0px;
+        }}
+    """,
 }
 
 def get_application_stylesheet() -> str:
-    \"\"\"Returns the complete QSS for the entire application.\"\"\"
-    return f\"\"\"
+    """Returns the complete QSS for the entire application."""
+    return f"""
         QMainWindow, QDialog {{
             background-color: {COLORS['bg_medium']};
             color: {COLORS['text_primary']};
@@ -390,16 +406,16 @@ def get_application_stylesheet() -> str:
         QLabel {{
             color: {COLORS['text_primary']};
         }}
-    \"\"\"
+    """
 
 def get_widget_style(widget_type: str) -> str:
-    \"\"\"Returns QSS for specific widget type.\"\"\"
+    """Returns QSS for specific widget type."""
     return STYLES.get(widget_type, "")
 
 def apply_hover_effect(base_style: str, hover_color: str) -> str:
-    \"\"\"Adds hover state to styles.\"\"\"
-    return f\"\"\"{base_style}
+    """Adds hover state to styles."""
+    return f"""{base_style}
         QPushButton:hover {{
             background-color: {hover_color};
         }}
-    \"\"\"
+    """

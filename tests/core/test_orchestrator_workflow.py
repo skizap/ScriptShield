@@ -1129,6 +1129,8 @@ class TestProgressTracking:
         assert hasattr(info, "estimated_remaining_seconds")
         assert hasattr(info, "current_state")
         assert hasattr(info, "message")
+        assert hasattr(info, "log_level")
+        assert info.log_level == "info"
 
     def test_progress_percentage_calculation(self, tmp_path: Path):
         """Verify progress percentage increases over time."""
