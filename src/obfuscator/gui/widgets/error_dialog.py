@@ -10,12 +10,14 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QGridLayout,
     QLabel,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
+from obfuscator.utils.error_formatting import extract_line_column, parse_error
 from obfuscator.gui.styles.stylesheet import COLORS, FONTS, SPACING
 
 
@@ -122,18 +124,60 @@ class ErrorHandlingDialog(QDialog):
         list_layout.setContentsMargins(12, 12, 12, 12)
         list_layout.setSpacing(8)
 
-        for error in self.errors:
-            error_label = QLabel(f"• {error}")
-            error_label.setStyleSheet(f"""
+        table_widget = QWidget()
+        table_layout = QGridLayout(table_widget)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setHorizontalSpacing(10)
+        table_layout.setVerticalSpacing(6)
+
+        headers = ["File", "Line", "Column", "Type", "Message"]
+        for col_index, header in enumerate(headers):
+            header_label = QLabel(header)
+            header_label.setStyleSheet(
+                f"""
                 QLabel {{
-                    color: {COLORS['error']};
-                    font-family: monospace;
+                    color: {COLORS['text_primary']};
+                    font-weight: {FONTS['weight_bold']};
                     font-size: 12px;
-                    padding: 4px;
                 }}
-            """)
-            error_label.setWordWrap(True)
-            list_layout.addWidget(error_label)
+                """
+            )
+            table_layout.addWidget(header_label, 0, col_index)
+
+        for row_index, error in enumerate(self.errors, start=1):
+            parsed = parse_error(error)
+
+            if parsed is not None:
+                file_value = Path(str(parsed.get("file_path") or self.file_path)).name
+                line_value = str(parsed.get("line") if parsed.get("line") is not None else 0)
+                column_value = str(parsed.get("column") if parsed.get("column") is not None else 0)
+                type_value = str(parsed.get("error_type") or "Error")
+                message_value = str(parsed.get("message") or error)
+            else:
+                line, column = extract_line_column(error)
+                file_value = self.file_path.name
+                line_value = str(line if line is not None else 0)
+                column_value = str(column if column is not None else 0)
+                type_value = "Error"
+                message_value = error
+
+            row_values = [file_value, line_value, column_value, type_value, message_value]
+            for col_index, value in enumerate(row_values):
+                value_label = QLabel(value)
+                value_label.setWordWrap(col_index == 4)
+                value_label.setStyleSheet(
+                    f"""
+                    QLabel {{
+                        color: {COLORS['error']};
+                        font-family: monospace;
+                        font-size: 11px;
+                        padding: 2px;
+                    }}
+                    """
+                )
+                table_layout.addWidget(value_label, row_index, col_index)
+
+        list_layout.addWidget(table_widget)
 
         list_layout.addStretch()
         scroll.setWidget(list_container)

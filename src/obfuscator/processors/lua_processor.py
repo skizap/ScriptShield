@@ -51,9 +51,16 @@ from obfuscator.processors.luau_extensions import (
     get_luau_metadata,
     validate_luau_syntax,
 )
+from obfuscator.processors.lua_feature_detector import LuaFeatureDetector
 from obfuscator.processors.lua_symbol_extractor import (
     LuaSymbolExtractor,
     LuaSymbolTable,
+)
+from obfuscator.core.exceptions import UnsupportedFeatureWarning
+from obfuscator.utils.error_formatting import (
+    extract_line_column,
+    format_error,
+    parse_error,
 )
 
 # Module constants
@@ -190,6 +197,94 @@ class LuaProcessor:
             self.logger.info("LuaProcessor initialized with Luau support enabled")
         else:
             self.logger.debug("LuaProcessor initialized")
+
+    def _extract_lua_exception_location(
+        self,
+        exc: Exception,
+        fallback_node: Any | None = None,
+    ) -> tuple[int | None, int | None]:
+        """Extract line/column from luaparser exceptions and traceback locals."""
+        line = None
+        for attribute in ("lineno", "line", "start_line", "row"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, int):
+                line = value
+                break
+
+        column = None
+        for attribute in ("offset", "col_offset", "column", "col", "position", "pos"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, int):
+                column = value
+                break
+
+        if line is not None or column is not None:
+            return line, column
+
+        traceback_obj = exc.__traceback__
+        while traceback_obj is not None:
+            frame_locals = traceback_obj.tb_frame.f_locals
+            for value in frame_locals.values():
+                candidate_line = getattr(value, "lineno", None)
+                if candidate_line is None:
+                    candidate_line = getattr(value, "line", None)
+
+                candidate_column = getattr(value, "col_offset", None)
+                if candidate_column is None:
+                    candidate_column = getattr(value, "column", None)
+                if candidate_column is None:
+                    candidate_column = getattr(value, "pos", None)
+
+                if candidate_line is not None or candidate_column is not None:
+                    return candidate_line, candidate_column
+
+            traceback_obj = traceback_obj.tb_next
+
+        if fallback_node is not None:
+            fallback_line = getattr(fallback_node, "lineno", None)
+            if fallback_line is None:
+                fallback_line = getattr(fallback_node, "line", None)
+
+            fallback_column = getattr(fallback_node, "col_offset", None)
+            if fallback_column is None:
+                fallback_column = getattr(fallback_node, "column", None)
+            if fallback_column is None:
+                fallback_column = getattr(fallback_node, "pos", None)
+
+            return fallback_line, fallback_column
+
+        return None, None
+
+    def _normalize_transform_errors(
+        self,
+        errors: list[str],
+        file_path: Path,
+        default_error_type: str,
+    ) -> list[str]:
+        """Normalize transformer errors to canonical structured format."""
+        if not errors:
+            return []
+
+        normalized_errors: list[str] = []
+
+        for error in errors:
+            parsed = parse_error(error)
+            if parsed is not None:
+                normalized_errors.append(error)
+                continue
+
+            line, column = extract_line_column(error)
+            normalized_errors.append(
+                format_error(
+                    file_path=file_path,
+                    line=line,
+                    column=column,
+                    error_type=default_error_type,
+                    message=error,
+                )
+            )
+
+        return normalized_errors
 
     def parse_file(self, file_path: Path | str) -> ParseResult:
         """Parse a Lua source file into an AST.
@@ -334,22 +429,47 @@ class LuaProcessor:
             if luau_metadata:
                 attach_luau_metadata(ast_node, luau_metadata)
 
+            detector = LuaFeatureDetector(path)
+            detector.visit(ast_node)
+            warnings = detector.get_warnings()
+
+            for warning in warnings:
+                structured_warning = UnsupportedFeatureWarning(
+                    feature_name=warning.feature_name,
+                    file_path=warning.file_path or path,
+                    line_number=warning.line_number,
+                    column_offset=warning.column_offset,
+                    message=warning.description,
+                    suggestion=warning.suggestion,
+                )
+                log_message = str(structured_warning)
+                if warning.severity in {"critical", "error"}:
+                    self.logger.error(log_message)
+                else:
+                    self.logger.warning(log_message)
+
+            self.logger.info(f"Detected {len(warnings)} unsupported feature(s) in {path}")
+
             return ParseResult(
                 ast_node=ast_node,
                 source_code=source_code,
                 file_path=path,
                 success=True,
                 errors=[],
+                warnings=warnings,
                 luau_metadata=luau_metadata,
                 luau_enabled=self.enable_luau,
                 luajit_features=luajit_features,
             )
         except SyntaxError as e:
-            # Format error message with line/column if available
-            if hasattr(e, "lineno") and hasattr(e, "offset"):
-                error_msg = f"Syntax error in {path} at line {e.lineno}, column {e.offset}: {e.msg}"
-            else:
-                error_msg = f"Syntax error in {path}: {e}"
+            line, column = self._extract_lua_exception_location(e)
+            error_msg = format_error(
+                file_path=path,
+                line=line,
+                column=column,
+                error_type="ParseError",
+                message=getattr(e, "msg", str(e)),
+            )
             self.logger.error(error_msg)
             return ParseResult(
                 ast_node=None,
@@ -362,7 +482,14 @@ class LuaProcessor:
                 luajit_features=luajit_features,
             )
         except Exception as e:
-            error_msg = f"Unexpected error parsing {path}: {e}"
+            line, column = self._extract_lua_exception_location(e)
+            error_msg = format_error(
+                file_path=path,
+                line=line,
+                column=column,
+                error_type="ParseError",
+                message=str(e),
+            )
             self.logger.error(error_msg, exc_info=True)
             return ParseResult(
                 ast_node=None,
@@ -672,7 +799,27 @@ class LuaProcessor:
             if mangle_enabled:
                 # Create the name mangling visitor and apply transformations
                 visitor = LuaNameManglingVisitor(global_table, path)
-                visitor.visit(ast_node)
+                try:
+                    visitor.visit(ast_node)
+                except Exception as e:
+                    line, column = self._extract_lua_exception_location(e, ast_node)
+                    structured_error = format_error(
+                        file_path=path,
+                        line=line,
+                        column=column,
+                        error_type="TransformationError",
+                        message=str(e),
+                    )
+                    self.logger.error(
+                        f"LuaNameManglingVisitor failed for {path.name}: {structured_error}",
+                        exc_info=True,
+                    )
+                    return {
+                        "code": "",
+                        "success": False,
+                        "errors": [structured_error],
+                        "engine": self._current_engine,
+                    }
             else:
                 self.logger.info(
                     f"Name mangling disabled for {path.name}; skipping LuaNameManglingVisitor"
@@ -691,6 +838,11 @@ class LuaProcessor:
                 engine_result = self._current_engine.apply_transformations(
                     ast_node, "lua", path
                 )
+                normalized_engine_errors = self._normalize_transform_errors(
+                    engine_result.errors,
+                    path,
+                    "TransformationError",
+                )
 
                 if engine_result.success:
                     self.logger.info(
@@ -702,12 +854,12 @@ class LuaProcessor:
                 else:
                     self.logger.error(
                         f"Engine transformations failed for {path.name}: "
-                        f"{engine_result.errors}"
+                        f"{normalized_engine_errors}"
                     )
                     return {
                         "code": "",
                         "success": False,
-                        "errors": engine_result.errors,
+                        "errors": normalized_engine_errors,
                         "engine": self._current_engine,
                     }
 
@@ -721,19 +873,35 @@ class LuaProcessor:
                     f"Successfully obfuscated {path.name} using GlobalSymbolTable"
                 )
             else:
+                normalized_generation_errors = self._normalize_transform_errors(
+                    gen_result.errors,
+                    path,
+                    "CodeGenerationError",
+                )
                 self.logger.warning(
-                    f"Obfuscation of {path.name} completed with errors: {gen_result.errors}"
+                    f"Obfuscation of {path.name} completed with errors: {normalized_generation_errors}"
                 )
 
             return {
                 "code": gen_result.code,
                 "success": gen_result.success,
-                "errors": gen_result.errors,
+                "errors": self._normalize_transform_errors(
+                    gen_result.errors,
+                    path,
+                    "CodeGenerationError",
+                ),
                 "engine": self._current_engine,
             }
 
         except Exception as e:
-            error_msg = f"Failed to obfuscate {path}: {e}"
+            line, column = self._extract_lua_exception_location(e, ast_node)
+            error_msg = format_error(
+                file_path=path,
+                line=line,
+                column=column,
+                error_type="TransformationError",
+                message=f"Failed to obfuscate {path.name}: {e}",
+            )
             self.logger.error(error_msg, exc_info=True)
             return {
                 "code": "",
@@ -746,6 +914,7 @@ class LuaProcessor:
         self,
         ast_node: luaparser.astnodes.Chunk,
         transformers: list[Any],
+        file_path: Path | str | None = None,
     ) -> GenerateResult:
         """Apply a pipeline of AST transformations to a Lua chunk.
 
@@ -769,6 +938,7 @@ class LuaProcessor:
         current_ast = ast_node
         total_count = 0
         all_errors: list[str] = []
+        path_for_errors = Path(file_path) if file_path is not None else Path("<unknown>")
 
         for idx, transformer in enumerate(transformers):
             name = type(transformer).__name__
@@ -776,15 +946,37 @@ class LuaProcessor:
                 f"Applying Lua transformer {idx + 1}/{len(transformers)}: {name}"
             )
 
-            result = transformer.transform(current_ast)
+            try:
+                result = transformer.transform(current_ast)
+            except Exception as e:
+                line, column = self._extract_lua_exception_location(e, current_ast)
+                structured_error = format_error(
+                    file_path=path_for_errors,
+                    line=line,
+                    column=column,
+                    error_type=f"{name}Error",
+                    message=str(e),
+                )
+                self.logger.error(structured_error, exc_info=True)
+                all_errors.append(structured_error)
+                return GenerateResult(
+                    code="",
+                    success=False,
+                    errors=all_errors,
+                )
 
             if not result.success:
+                normalized_errors = self._normalize_transform_errors(
+                    result.errors,
+                    path_for_errors,
+                    f"{name}Error",
+                )
                 error_msg = (
                     f"Lua transformer {name} failed: "
-                    f"{', '.join(result.errors)}"
+                    f"{', '.join(normalized_errors)}"
                 )
                 self.logger.error(error_msg)
-                all_errors.extend(result.errors)
+                all_errors.extend(normalized_errors)
                 return GenerateResult(
                     code="",
                     success=False,

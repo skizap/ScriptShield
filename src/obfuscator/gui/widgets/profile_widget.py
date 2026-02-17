@@ -25,7 +25,13 @@ from obfuscator.utils.logger import get_logger
 from obfuscator.utils.path_utils import ensure_directory
 from obfuscator.gui.styles.stylesheet import get_widget_style
 from obfuscator.core.profile_manager import ProfileManager
-from obfuscator.core.config import ObfuscationConfig
+from obfuscator.core.config import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_MEMORY_THRESHOLD_PERCENT,
+    DEFAULT_MULTIPROCESSING_THRESHOLD,
+    ObfuscationConfig,
+)
 
 logger = get_logger("obfuscator.gui.widgets.profile_widget")
 
@@ -139,6 +145,17 @@ class ProfileWidget(QWidget):
             preset = security_config.get("preset")  # Don't default to "medium"
             features = security_config.get("features", {})
             runtime_mode = security_config.get("runtime_mode", "hybrid")
+            enable_multiprocessing = security_config.get("enable_multiprocessing", True)
+            max_workers = security_config.get("max_workers", DEFAULT_MAX_WORKERS)
+            batch_size = security_config.get("batch_size", DEFAULT_BATCH_SIZE)
+            multiprocessing_threshold = security_config.get(
+                "multiprocessing_threshold",
+                DEFAULT_MULTIPROCESSING_THRESHOLD,
+            )
+            memory_threshold_percent = security_config.get(
+                "memory_threshold_percent",
+                DEFAULT_MEMORY_THRESHOLD_PERCENT,
+            )
 
             # Extract language and options from config
             language = config.get("language", "lua")
@@ -155,7 +172,12 @@ class ProfileWidget(QWidget):
                 name=profile_name,
                 preset=preset,  # Can be None for custom configurations
                 features=features,
-                language=language
+                language=language,
+                enable_multiprocessing=enable_multiprocessing,
+                max_workers=max_workers,
+                batch_size=batch_size,
+                multiprocessing_threshold=multiprocessing_threshold,
+                memory_threshold_percent=memory_threshold_percent,
             )
 
             # Set runtime_mode from GUI config
@@ -244,6 +266,37 @@ class ProfileWidget(QWidget):
 
             # Get runtime_mode from config_obj or profile_data
             runtime_mode = getattr(config_obj, 'runtime_mode', None) or profile_data.get('runtime_mode', 'hybrid')
+            enable_multiprocessing = getattr(
+                config_obj,
+                "enable_multiprocessing",
+                profile_data.get("enable_multiprocessing", True),
+            )
+            max_workers = getattr(
+                config_obj,
+                "max_workers",
+                profile_data.get("max_workers", DEFAULT_MAX_WORKERS),
+            )
+            batch_size = getattr(
+                config_obj,
+                "batch_size",
+                profile_data.get("batch_size", DEFAULT_BATCH_SIZE),
+            )
+            multiprocessing_threshold = getattr(
+                config_obj,
+                "multiprocessing_threshold",
+                profile_data.get(
+                    "multiprocessing_threshold",
+                    DEFAULT_MULTIPROCESSING_THRESHOLD,
+                ),
+            )
+            memory_threshold_percent = getattr(
+                config_obj,
+                "memory_threshold_percent",
+                profile_data.get(
+                    "memory_threshold_percent",
+                    DEFAULT_MEMORY_THRESHOLD_PERCENT,
+                ),
+            )
 
             # Transform to match current GUI format
             # Include security_config, output_path, and files
@@ -252,6 +305,11 @@ class ProfileWidget(QWidget):
                     "preset": preset_gui,
                     "features": gui_features,
                     "runtime_mode": runtime_mode,
+                    "enable_multiprocessing": enable_multiprocessing,
+                    "max_workers": max_workers,
+                    "batch_size": batch_size,
+                    "multiprocessing_threshold": multiprocessing_threshold,
+                    "memory_threshold_percent": memory_threshold_percent,
                 }
             }
 

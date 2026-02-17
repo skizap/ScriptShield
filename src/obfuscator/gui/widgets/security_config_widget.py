@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QRadioButton,
     QButtonGroup,
+    QSpinBox,
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QCursor
@@ -23,11 +24,20 @@ from typing import TYPE_CHECKING
 
 from obfuscator.utils.logger import get_logger
 from obfuscator.gui.styles.stylesheet import get_widget_style, COLORS
+from obfuscator.core.config import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_ENABLE_MULTIPROCESSING,
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_MEMORY_THRESHOLD_PERCENT,
+    DEFAULT_MULTIPROCESSING_THRESHOLD,
+)
 
 if TYPE_CHECKING:
     from obfuscator.gui.widgets.file_selection_widget import FileSelectionWidget
 
 logger = get_logger("obfuscator.gui.widgets.security_config_widget")
+
+_UNSET = object()
 
 # Feature tooltips
 FEATURE_TOOLTIPS = {
@@ -142,6 +152,16 @@ class SecurityConfigWidget(QWidget):
         self._runtime_button_group: QButtonGroup = None
         self._hybrid_radio: QRadioButton = None
         self._embedded_radio: QRadioButton = None
+        self._enable_multiprocessing: bool = DEFAULT_ENABLE_MULTIPROCESSING
+        self._max_workers: int | None = DEFAULT_MAX_WORKERS
+        self._batch_size: int = DEFAULT_BATCH_SIZE
+        self._multiprocessing_threshold: int = DEFAULT_MULTIPROCESSING_THRESHOLD
+        self._memory_threshold_percent: int = DEFAULT_MEMORY_THRESHOLD_PERCENT
+        self._multiprocessing_checkbox: QCheckBox = None
+        self._max_workers_spinbox: QSpinBox = None
+        self._batch_size_spinbox: QSpinBox = None
+        self._multiprocessing_threshold_spinbox: QSpinBox = None
+        self._memory_threshold_spinbox: QSpinBox = None
 
         self._init_features()
         self._setup_ui()
@@ -370,6 +390,142 @@ class SecurityConfigWidget(QWidget):
         # Roblox features section
         self._add_feature_section(panel_layout, "Roblox-Specific Features", ROBLOX_FEATURES)
 
+        # Performance settings section
+        performance_label = QLabel("Performance Settings")
+        performance_label.setStyleSheet(get_widget_style("section_label"))
+        performance_label.setToolTip(
+            "Advanced multiprocessing controls. Worker count and batch size are auto-tuned by default."
+        )
+        panel_layout.addWidget(performance_label)
+
+        self._multiprocessing_checkbox = QCheckBox("Enable Multiprocessing")
+        self._multiprocessing_checkbox.setProperty(
+            "data-element-id",
+            "enable-multiprocessing-checkbox",
+        )
+        self._multiprocessing_checkbox.setStyleSheet(get_widget_style("checkbox"))
+        self._multiprocessing_checkbox.setChecked(self._enable_multiprocessing)
+        self._multiprocessing_checkbox.setToolTip(
+            "Use multiple CPU cores for faster processing of large projects (100+ files). "
+            "Disable for debugging or memory-constrained systems. Batch size and worker count are "
+            "auto-tuned by default. Multiprocessing is skipped for small projects and memory pressure "
+            "dynamically reduces batch sizes."
+        )
+        self._multiprocessing_checkbox.stateChanged.connect(
+            lambda state: self._on_multiprocessing_toggled(state == 2)
+        )
+        panel_layout.addWidget(self._multiprocessing_checkbox)
+
+        max_workers_layout = QHBoxLayout()
+        max_workers_layout.setContentsMargins(0, 0, 0, 0)
+        max_workers_layout.setSpacing(8)
+        max_workers_label = QLabel("Max Workers")
+        max_workers_label.setToolTip(
+            "Maximum worker processes for parallel execution. Set to Auto to use CPU count - 1 (up to 8)."
+        )
+        max_workers_layout.addWidget(max_workers_label)
+        max_workers_layout.addStretch()
+
+        self._max_workers_spinbox = QSpinBox()
+        self._max_workers_spinbox.setProperty(
+            "data-element-id",
+            "max-workers-spinbox",
+        )
+        self._max_workers_spinbox.setRange(0, 16)
+        self._max_workers_spinbox.setSpecialValueText("Auto")
+        self._max_workers_spinbox.setValue(
+            0 if self._max_workers is None else self._max_workers
+        )
+        self._max_workers_spinbox.setToolTip(
+            "Worker process limit. Auto chooses CPU count - 1 (capped at 8). "
+            "Manual values are validated in the range 1-16."
+        )
+        self._max_workers_spinbox.valueChanged.connect(self._on_max_workers_changed)
+        max_workers_layout.addWidget(self._max_workers_spinbox)
+        panel_layout.addLayout(max_workers_layout)
+
+        batch_size_layout = QHBoxLayout()
+        batch_size_layout.setContentsMargins(0, 0, 0, 0)
+        batch_size_layout.setSpacing(8)
+        batch_size_label = QLabel("Batch Size")
+        batch_size_label.setToolTip(
+            "Files assigned to each worker batch. Larger values improve throughput but increase memory usage."
+        )
+        batch_size_layout.addWidget(batch_size_label)
+        batch_size_layout.addStretch()
+
+        self._batch_size_spinbox = QSpinBox()
+        self._batch_size_spinbox.setProperty(
+            "data-element-id",
+            "batch-size-spinbox",
+        )
+        self._batch_size_spinbox.setRange(10, 200)
+        self._batch_size_spinbox.setValue(self._batch_size)
+        self._batch_size_spinbox.setToolTip(
+            "Initial files per multiprocessing batch. Valid range: 10-200. "
+            "May be reduced at runtime when memory pressure is detected."
+        )
+        self._batch_size_spinbox.valueChanged.connect(self._on_batch_size_changed)
+        batch_size_layout.addWidget(self._batch_size_spinbox)
+        panel_layout.addLayout(batch_size_layout)
+
+        multiprocessing_threshold_layout = QHBoxLayout()
+        multiprocessing_threshold_layout.setContentsMargins(0, 0, 0, 0)
+        multiprocessing_threshold_layout.setSpacing(8)
+        multiprocessing_threshold_label = QLabel("Parallel Threshold")
+        multiprocessing_threshold_label.setToolTip(
+            "Minimum file count required before multiprocessing is used. "
+            "Smaller projects run sequentially below this threshold."
+        )
+        multiprocessing_threshold_layout.addWidget(multiprocessing_threshold_label)
+        multiprocessing_threshold_layout.addStretch()
+
+        self._multiprocessing_threshold_spinbox = QSpinBox()
+        self._multiprocessing_threshold_spinbox.setProperty(
+            "data-element-id",
+            "multiprocessing-threshold-spinbox",
+        )
+        self._multiprocessing_threshold_spinbox.setRange(10, 1000)
+        self._multiprocessing_threshold_spinbox.setValue(self._multiprocessing_threshold)
+        self._multiprocessing_threshold_spinbox.setToolTip(
+            "Minimum number of files required to trigger multiprocessing. "
+            "Valid range: 10-1000."
+        )
+        self._multiprocessing_threshold_spinbox.valueChanged.connect(
+            self._on_multiprocessing_threshold_changed
+        )
+        multiprocessing_threshold_layout.addWidget(self._multiprocessing_threshold_spinbox)
+        panel_layout.addLayout(multiprocessing_threshold_layout)
+
+        memory_threshold_layout = QHBoxLayout()
+        memory_threshold_layout.setContentsMargins(0, 0, 0, 0)
+        memory_threshold_layout.setSpacing(8)
+        memory_threshold_label = QLabel("Memory Threshold (%)")
+        memory_threshold_label.setToolTip(
+            "Memory pressure threshold for adaptive batch downsizing. "
+            "When usage exceeds this percentage, batches are reduced."
+        )
+        memory_threshold_layout.addWidget(memory_threshold_label)
+        memory_threshold_layout.addStretch()
+
+        self._memory_threshold_spinbox = QSpinBox()
+        self._memory_threshold_spinbox.setProperty(
+            "data-element-id",
+            "memory-threshold-spinbox",
+        )
+        self._memory_threshold_spinbox.setRange(50, 95)
+        self._memory_threshold_spinbox.setValue(self._memory_threshold_percent)
+        self._memory_threshold_spinbox.setSuffix("%")
+        self._memory_threshold_spinbox.setToolTip(
+            "Maximum memory usage percentage before worker batch sizes are reduced. "
+            "Valid range: 50-95%."
+        )
+        self._memory_threshold_spinbox.valueChanged.connect(
+            self._on_memory_threshold_percent_changed
+        )
+        memory_threshold_layout.addWidget(self._memory_threshold_spinbox)
+        panel_layout.addLayout(memory_threshold_layout)
+
         parent_layout.addWidget(self._features_panel)
 
     def _add_feature_section(
@@ -464,6 +620,45 @@ class SecurityConfigWidget(QWidget):
 
         logger.debug(f"Feature toggled: {feature_name} = {checked}")
 
+    def _on_multiprocessing_toggled(self, enabled: bool) -> None:
+        """Handle multiprocessing checkbox toggle."""
+        self._enable_multiprocessing = enabled
+        self._emit_config_changed()
+        logger.debug(f"Multiprocessing enabled: {enabled}")
+
+    def _on_max_workers_changed(self, value: int) -> None:
+        """Handle max workers spinbox changes."""
+        self._max_workers = None if value == 0 else int(value)
+        self._emit_config_changed()
+        logger.debug(
+            "Max workers changed to: %s",
+            "auto" if self._max_workers is None else self._max_workers,
+        )
+
+    def _on_batch_size_changed(self, value: int) -> None:
+        """Handle batch size spinbox changes."""
+        self._batch_size = int(value)
+        self._emit_config_changed()
+        logger.debug("Batch size changed to: %d", self._batch_size)
+
+    def _on_multiprocessing_threshold_changed(self, value: int) -> None:
+        """Handle multiprocessing threshold spinbox changes."""
+        self._multiprocessing_threshold = int(value)
+        self._emit_config_changed()
+        logger.debug(
+            "Multiprocessing threshold changed to: %d",
+            self._multiprocessing_threshold,
+        )
+
+    def _on_memory_threshold_percent_changed(self, value: int) -> None:
+        """Handle memory threshold percent spinbox changes."""
+        self._memory_threshold_percent = int(value)
+        self._emit_config_changed()
+        logger.debug(
+            "Memory threshold percent changed to: %d",
+            self._memory_threshold_percent,
+        )
+
     def _find_matching_preset(self) -> str | None:
         """Find if current feature configuration matches any preset."""
         current_enabled = {f for f, enabled in self._features.items() if enabled}
@@ -512,10 +707,23 @@ class SecurityConfigWidget(QWidget):
             "preset": self._current_preset,
             "features": dict(self._features),
             "runtime_mode": self._runtime_mode,
+            "enable_multiprocessing": self._enable_multiprocessing,
+            "max_workers": self._max_workers,
+            "batch_size": self._batch_size,
+            "multiprocessing_threshold": self._multiprocessing_threshold,
+            "memory_threshold_percent": self._memory_threshold_percent,
         }
 
     def set_config(
-        self, preset: str = None, features: dict = None, runtime_mode: str = None
+        self,
+        preset: str = None,
+        features: dict = None,
+        runtime_mode: str = None,
+        enable_multiprocessing: bool = None,
+        max_workers: int | None | object = _UNSET,
+        batch_size: int | object = _UNSET,
+        multiprocessing_threshold: int | object = _UNSET,
+        memory_threshold_percent: int | object = _UNSET,
     ) -> None:
         """Set configuration programmatically.
 
@@ -544,6 +752,102 @@ class SecurityConfigWidget(QWidget):
             self._embedded_radio.setChecked(False)
             self._hybrid_radio.blockSignals(False)
             self._embedded_radio.blockSignals(False)
+
+        if enable_multiprocessing is not None:
+            self._enable_multiprocessing = bool(enable_multiprocessing)
+            if self._multiprocessing_checkbox is not None:
+                self._multiprocessing_checkbox.blockSignals(True)
+                self._multiprocessing_checkbox.setChecked(self._enable_multiprocessing)
+                self._multiprocessing_checkbox.blockSignals(False)
+            logger.debug(
+                "Multiprocessing setting set to: %s",
+                self._enable_multiprocessing,
+            )
+
+        if max_workers is not _UNSET:
+            if max_workers is None:
+                self._max_workers = None
+            else:
+                try:
+                    parsed_max_workers = int(max_workers)
+                except (TypeError, ValueError):
+                    logger.warning("Invalid max_workers '%s', defaulting to auto", max_workers)
+                    parsed_max_workers = 0
+
+                self._max_workers = None if parsed_max_workers <= 0 else max(1, min(16, parsed_max_workers))
+
+            if self._max_workers_spinbox is not None:
+                self._max_workers_spinbox.blockSignals(True)
+                self._max_workers_spinbox.setValue(
+                    0 if self._max_workers is None else self._max_workers
+                )
+                self._max_workers_spinbox.blockSignals(False)
+
+            logger.debug(
+                "Max workers setting set to: %s",
+                "auto" if self._max_workers is None else self._max_workers,
+            )
+
+        if batch_size is not _UNSET:
+            try:
+                parsed_batch_size = int(batch_size)
+            except (TypeError, ValueError):
+                logger.warning("Invalid batch_size '%s', using default %d", batch_size, DEFAULT_BATCH_SIZE)
+                parsed_batch_size = DEFAULT_BATCH_SIZE
+
+            self._batch_size = max(10, min(200, parsed_batch_size))
+            if self._batch_size_spinbox is not None:
+                self._batch_size_spinbox.blockSignals(True)
+                self._batch_size_spinbox.setValue(self._batch_size)
+                self._batch_size_spinbox.blockSignals(False)
+
+            logger.debug("Batch size setting set to: %d", self._batch_size)
+
+        if multiprocessing_threshold is not _UNSET:
+            try:
+                parsed_threshold = int(multiprocessing_threshold)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid multiprocessing_threshold '%s', using default %d",
+                    multiprocessing_threshold,
+                    DEFAULT_MULTIPROCESSING_THRESHOLD,
+                )
+                parsed_threshold = DEFAULT_MULTIPROCESSING_THRESHOLD
+
+            self._multiprocessing_threshold = max(10, min(1000, parsed_threshold))
+            if self._multiprocessing_threshold_spinbox is not None:
+                self._multiprocessing_threshold_spinbox.blockSignals(True)
+                self._multiprocessing_threshold_spinbox.setValue(
+                    self._multiprocessing_threshold
+                )
+                self._multiprocessing_threshold_spinbox.blockSignals(False)
+
+            logger.debug(
+                "Multiprocessing threshold setting set to: %d",
+                self._multiprocessing_threshold,
+            )
+
+        if memory_threshold_percent is not _UNSET:
+            try:
+                parsed_memory_threshold = int(memory_threshold_percent)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid memory_threshold_percent '%s', using default %d",
+                    memory_threshold_percent,
+                    DEFAULT_MEMORY_THRESHOLD_PERCENT,
+                )
+                parsed_memory_threshold = DEFAULT_MEMORY_THRESHOLD_PERCENT
+
+            self._memory_threshold_percent = max(50, min(95, parsed_memory_threshold))
+            if self._memory_threshold_spinbox is not None:
+                self._memory_threshold_spinbox.blockSignals(True)
+                self._memory_threshold_spinbox.setValue(self._memory_threshold_percent)
+                self._memory_threshold_spinbox.blockSignals(False)
+
+            logger.debug(
+                "Memory threshold percent setting set to: %d",
+                self._memory_threshold_percent,
+            )
 
         if preset is not None and preset in PRESET_CONFIGS:
             self._on_preset_clicked(preset)
@@ -584,4 +888,39 @@ class SecurityConfigWidget(QWidget):
         self._embedded_radio.setChecked(False)
         self._hybrid_radio.blockSignals(False)
         self._embedded_radio.blockSignals(False)
+
+        self._enable_multiprocessing = DEFAULT_ENABLE_MULTIPROCESSING
+        if self._multiprocessing_checkbox is not None:
+            self._multiprocessing_checkbox.blockSignals(True)
+            self._multiprocessing_checkbox.setChecked(DEFAULT_ENABLE_MULTIPROCESSING)
+            self._multiprocessing_checkbox.blockSignals(False)
+
+        self._max_workers = DEFAULT_MAX_WORKERS
+        if self._max_workers_spinbox is not None:
+            self._max_workers_spinbox.blockSignals(True)
+            self._max_workers_spinbox.setValue(
+                0 if self._max_workers is None else self._max_workers
+            )
+            self._max_workers_spinbox.blockSignals(False)
+
+        self._batch_size = DEFAULT_BATCH_SIZE
+        if self._batch_size_spinbox is not None:
+            self._batch_size_spinbox.blockSignals(True)
+            self._batch_size_spinbox.setValue(DEFAULT_BATCH_SIZE)
+            self._batch_size_spinbox.blockSignals(False)
+
+        self._multiprocessing_threshold = DEFAULT_MULTIPROCESSING_THRESHOLD
+        if self._multiprocessing_threshold_spinbox is not None:
+            self._multiprocessing_threshold_spinbox.blockSignals(True)
+            self._multiprocessing_threshold_spinbox.setValue(
+                DEFAULT_MULTIPROCESSING_THRESHOLD
+            )
+            self._multiprocessing_threshold_spinbox.blockSignals(False)
+
+        self._memory_threshold_percent = DEFAULT_MEMORY_THRESHOLD_PERCENT
+        if self._memory_threshold_spinbox is not None:
+            self._memory_threshold_spinbox.blockSignals(True)
+            self._memory_threshold_spinbox.setValue(DEFAULT_MEMORY_THRESHOLD_PERCENT)
+            self._memory_threshold_spinbox.blockSignals(False)
+
         logger.debug("Runtime mode reset to: hybrid")

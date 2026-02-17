@@ -117,6 +117,63 @@ transformations, including error tracking, transformation counting,
         self.errors: list[str] = []
         self.logger = logger
         self.runtime_manager = kwargs.get('runtime_manager', None)
+        self._last_visited_node: Any | None = None
+
+    def visit(self, node: Any) -> Any:
+        """Track the current node before delegating to NodeTransformer.visit."""
+        self._last_visited_node = node
+        return super().visit(node)
+
+    def _extract_node_location(self, node: Any) -> tuple[int | None, int | None]:
+        """Safely extract line/column location from Python or Lua AST nodes."""
+        if node is None:
+            return (None, None)
+
+        line = getattr(node, "lineno", None)
+        if line is None:
+            line = getattr(node, "line", None)
+
+        column = getattr(node, "col_offset", None)
+        if column is None:
+            column = getattr(node, "column", None)
+        if column is None:
+            column = getattr(node, "offset", None)
+
+        return line, column
+
+    def _format_error_with_location(self, node: Any, error_message: str) -> str:
+        """Format an error message with AST node location when available."""
+        line, column = self._extract_node_location(node)
+
+        if line is not None and column is not None:
+            return f"line {line}, column {column}: {error_message}"
+        if line is not None:
+            return f"line {line}: {error_message}"
+        if column is not None:
+            return f"column {column}: {error_message}"
+        return error_message
+
+    def _extract_node_from_exception(self, exc: Exception) -> Any | None:
+        """Try to find the AST node being processed from exception traceback locals."""
+        traceback_obj = exc.__traceback__
+        while traceback_obj is not None:
+            frame_locals = traceback_obj.tb_frame.f_locals
+
+            for key in ("node", "current_node", "ast_node", "target_node"):
+                candidate = frame_locals.get(key)
+                if candidate is not None:
+                    line, column = self._extract_node_location(candidate)
+                    if line is not None or column is not None:
+                        return candidate
+
+            for candidate in frame_locals.values():
+                line, column = self._extract_node_location(candidate)
+                if line is not None or column is not None:
+                    return candidate
+
+            traceback_obj = traceback_obj.tb_next
+
+        return None
 
     def transform(self, ast_node: ast.AST) -> TransformResult:
         """Apply this transformer to an AST node.
@@ -149,6 +206,7 @@ transformations, including error tracking, transformation counting,
         # Reset state for this transformation
         self.transformation_count = 0
         self.errors = []
+        self._last_visited_node = ast_node
 
         try:
             # Fix missing locations in the AST
@@ -176,7 +234,12 @@ transformations, including error tracking, transformation counting,
             )
 
         except Exception as e:
-            error_msg = f"Transformation failed: {e.__class__.__name__}: {e}"
+            current_node = self._extract_node_from_exception(e) or self._last_visited_node
+            error_detail = f"{e.__class__.__name__}: {e}"
+            if current_node is not None:
+                error_msg = self._format_error_with_location(current_node, error_detail)
+            else:
+                error_msg = f"Transformation failed: {error_detail}"
             self.logger.error(error_msg, exc_info=True)
             self.errors.append(error_msg)
 

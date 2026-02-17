@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from obfuscator.core.config import ObfuscationConfig
+from obfuscator.core.worker import WorkerResult
 from obfuscator.core.orchestrator import (
     ConflictDetectionResult,
     ConflictInfo,
@@ -94,6 +95,95 @@ def _write_file(tmp_path: Path, name: str, code: str) -> Path:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(textwrap.dedent(code), encoding="utf-8")
     return file_path
+
+
+class _ReadyAsyncResult:
+    """Minimal async-result test double that is immediately ready."""
+
+    def ready(self) -> bool:
+        return True
+
+
+class _FakeProcessPoolManager:
+    """Test double for ProcessPoolManager used by multiprocessing tests."""
+
+    instances: list["_FakeProcessPoolManager"] = []
+    response_builder = staticmethod(lambda task: [])
+
+    def __init__(
+        self,
+        worker_count: int | None = None,
+        max_workers: int | None = None,
+        batch_size: int = 75,
+        memory_threshold_percent: int = 80,
+        min_batch_size: int = 25,
+        grace_period: float = 5.0,
+    ) -> None:
+        _ = (
+            worker_count,
+            max_workers,
+            memory_threshold_percent,
+            min_batch_size,
+            grace_period,
+        )
+        self.worker_count = 2
+        self.batch_size = batch_size
+        self.pool = object()
+        self.submitted_task = None
+        self.terminated = False
+        type(self).instances.append(self)
+
+    def __enter__(self) -> _FakeProcessPoolManager:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        _ = (exc_type, exc_value, traceback)
+        self.pool = None
+
+    def create_batches(self, file_paths: list[Path], batch_size: int) -> list[list[Path]]:
+        _ = batch_size
+        return [list(file_paths)]
+
+    def submit_batch(self, task):
+        self.submitted_task = task
+        return _ReadyAsyncResult()
+
+    def collect_results(self, async_results, timeout: float | None = None) -> list[WorkerResult]:
+        _ = (async_results, timeout)
+        assert self.submitted_task is not None
+        return type(self).response_builder(self.submitted_task)
+
+    def terminate_pool(self) -> None:
+        self.terminated = True
+        self.pool = None
+
+
+def _build_worker_result(
+    task: Any,
+    file_path: str,
+    success: bool,
+    errors: list[str] | None = None,
+    transformation_count: int = 0,
+) -> WorkerResult:
+    """Build a WorkerResult matching fake ProcessPoolManager task payloads."""
+    if success:
+        output_path = str(Path(task.output_dir) / Path(file_path).name)
+        resolved_errors: list[str] = []
+    else:
+        output_path = None
+        resolved_errors = list(errors or ["Synthetic worker failure"])
+
+    return WorkerResult(
+        task_id=task.task_id,
+        file_path=file_path,
+        success=success,
+        output_path=output_path,
+        errors=resolved_errors,
+        warnings=[],
+        detailed_errors=[],
+        transformation_count=transformation_count,
+        processing_time=0.01,
+    )
 
 
 # ===========================================================================
@@ -1029,6 +1119,155 @@ class TestErrorHandling:
         )
 
         assert mock_cb.call_count == 2
+
+    def test_parallel_error_strategy_stop_halts_on_first_worker_error(self, tmp_path: Path):
+        """STOP strategy should fail fast in multiprocessing and terminate the pool."""
+        config = _make_config()
+        config.multiprocessing_threshold = 1
+        orchestrator = ObfuscationOrchestrator(config=config)
+        output_dir = tmp_path / "output"
+        files = [
+            _write_file(tmp_path, "f1.py", "x = 1\n"),
+            _write_file(tmp_path, "f2.py", "y = 2\n"),
+        ]
+
+        _FakeProcessPoolManager.instances.clear()
+
+        def build_results(task) -> list[WorkerResult]:
+            return [
+                _build_worker_result(
+                    task,
+                    task.file_paths[0],
+                    success=False,
+                    errors=["Parallel simulated error"],
+                ),
+                _build_worker_result(
+                    task,
+                    task.file_paths[1],
+                    success=True,
+                    transformation_count=2,
+                ),
+            ]
+
+        _FakeProcessPoolManager.response_builder = build_results
+
+        with patch(
+            "obfuscator.core.orchestrator.ProcessPoolManager", _FakeProcessPoolManager
+        ):
+            result = orchestrator.process_files(
+                input_files=files,
+                output_dir=output_dir,
+                config=config.symbol_table_options,
+                project_root=tmp_path,
+                error_strategy=ErrorStrategy.STOP,
+            )
+
+        assert result.current_state == JobState.FAILED
+        assert result.success is False
+        assert result.metadata.get("halted_due_to_worker_errors") is True
+        assert result.metadata.get("halted_by_error_strategy") == ErrorStrategy.STOP.value
+        assert len(result.metadata.get("files_skipped_due_to_error_strategy", [])) == 1
+        assert len(result.processed_files) == 1
+        assert _FakeProcessPoolManager.instances[0].terminated is True
+
+    def test_parallel_error_strategy_ask_without_callback_defaults_to_stop(self, tmp_path: Path):
+        """ASK strategy should default to STOP when callback is not provided in multiprocessing."""
+        config = _make_config()
+        config.multiprocessing_threshold = 1
+        orchestrator = ObfuscationOrchestrator(config=config)
+        output_dir = tmp_path / "output"
+        files = [
+            _write_file(tmp_path, "f1.py", "x = 1\n"),
+            _write_file(tmp_path, "f2.py", "y = 2\n"),
+        ]
+
+        _FakeProcessPoolManager.instances.clear()
+
+        def build_results(task) -> list[WorkerResult]:
+            return [
+                _build_worker_result(
+                    task,
+                    task.file_paths[0],
+                    success=False,
+                    errors=["Parallel simulated error"],
+                ),
+                _build_worker_result(task, task.file_paths[1], success=True),
+            ]
+
+        _FakeProcessPoolManager.response_builder = build_results
+
+        with patch(
+            "obfuscator.core.orchestrator.ProcessPoolManager", _FakeProcessPoolManager
+        ):
+            result = orchestrator.process_files(
+                input_files=files,
+                output_dir=output_dir,
+                config=config.symbol_table_options,
+                project_root=tmp_path,
+                error_strategy=ErrorStrategy.ASK,
+            )
+
+        assert result.current_state == JobState.FAILED
+        assert result.success is False
+        assert result.metadata.get("halted_due_to_worker_errors") is True
+        assert result.metadata.get("halted_by_error_strategy") == ErrorStrategy.ASK.value
+        assert len(result.processed_files) == 1
+        assert result.metadata["error_decisions"][0]["decision"] == "stop"
+        assert _FakeProcessPoolManager.instances[0].terminated is True
+
+    def test_parallel_error_strategy_ask_invokes_callback_per_failed_file(self, tmp_path: Path):
+        """ASK strategy should invoke callback for each failed worker result."""
+        config = _make_config()
+        config.multiprocessing_threshold = 1
+        orchestrator = ObfuscationOrchestrator(config=config)
+        output_dir = tmp_path / "output"
+        files = [
+            _write_file(tmp_path, "f1.py", "x = 1\n"),
+            _write_file(tmp_path, "f2.py", "y = 2\n"),
+        ]
+
+        _FakeProcessPoolManager.instances.clear()
+
+        def build_results(task) -> list[WorkerResult]:
+            return [
+                _build_worker_result(
+                    task,
+                    task.file_paths[0],
+                    success=False,
+                    errors=["Parallel error 1"],
+                ),
+                _build_worker_result(
+                    task,
+                    task.file_paths[1],
+                    success=False,
+                    errors=["Parallel error 2"],
+                ),
+            ]
+
+        _FakeProcessPoolManager.response_builder = build_results
+        callback = MagicMock(return_value=True)
+
+        with patch(
+            "obfuscator.core.orchestrator.ProcessPoolManager", _FakeProcessPoolManager
+        ):
+            result = orchestrator.process_files(
+                input_files=files,
+                output_dir=output_dir,
+                config=config.symbol_table_options,
+                project_root=tmp_path,
+                error_strategy=ErrorStrategy.ASK,
+                error_callback=callback,
+            )
+
+        assert result.current_state == JobState.COMPLETED
+        assert result.success is True
+        assert callback.call_count == 2
+        assert len(result.processed_files) == 2
+        assert [entry["decision"] for entry in result.metadata["error_decisions"]] == [
+            "continue",
+            "continue",
+        ]
+        assert _FakeProcessPoolManager.instances[0].terminated is False
 
     def test_error_logging(self, tmp_path: Path, caplog):
         """Verify errors are logged with ERROR level."""

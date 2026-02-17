@@ -49,6 +49,11 @@ from obfuscator.processors.symbol_extractor import (
     SymbolExtractor,
     SymbolTable,
 )
+from obfuscator.utils.error_formatting import (
+    extract_line_column,
+    format_error,
+    parse_error,
+)
 from obfuscator.utils.logger import get_logger
 
 # Import for type checking only to avoid circular imports
@@ -57,6 +62,7 @@ if TYPE_CHECKING:
     from obfuscator.core.config import ObfuscationConfig
     from obfuscator.core.symbol_table import GlobalSymbolTable
 from obfuscator.core.obfuscation_engine import ObfuscationEngine
+from obfuscator.core.exceptions import UnsupportedFeatureWarning
 
 logger = get_logger("obfuscator.processors.python_processor")
 
@@ -222,6 +228,70 @@ class PythonProcessor:
         """
         return self._current_engine
 
+    def _extract_ast_node_location(
+        self, node: ast.AST | None
+    ) -> tuple[int | None, int | None]:
+        """Extract line/column location from an AST node when available."""
+        if node is None:
+            return (None, None)
+        return (getattr(node, "lineno", None), getattr(node, "col_offset", None))
+
+    def _extract_exception_location(
+        self,
+        exc: Exception,
+        fallback_node: ast.AST | None = None,
+    ) -> tuple[int | None, int | None]:
+        """Extract best-effort location info from exception or traceback locals."""
+        line = getattr(exc, "lineno", None)
+        column = getattr(exc, "offset", None)
+        if column is None:
+            column = getattr(exc, "col_offset", None)
+
+        if line is not None or column is not None:
+            return line, column
+
+        traceback_obj = exc.__traceback__
+        while traceback_obj is not None:
+            for value in traceback_obj.tb_frame.f_locals.values():
+                if isinstance(value, ast.AST):
+                    node_line, node_column = self._extract_ast_node_location(value)
+                    if node_line is not None or node_column is not None:
+                        return node_line, node_column
+            traceback_obj = traceback_obj.tb_next
+
+        return self._extract_ast_node_location(fallback_node)
+
+    def _normalize_transform_errors(
+        self,
+        errors: list[str],
+        file_path: Path,
+        default_error_type: str,
+    ) -> list[str]:
+        """Normalize transformer error strings to structured error format."""
+        if not errors:
+            return []
+
+        normalized_errors: list[str] = []
+
+        for error in errors:
+            parsed = parse_error(error)
+            if parsed is not None:
+                normalized_errors.append(error)
+                continue
+
+            line, column = extract_line_column(error)
+            normalized_errors.append(
+                format_error(
+                    file_path=file_path,
+                    line=line,
+                    column=column,
+                    error_type=default_error_type,
+                    message=error,
+                )
+            )
+
+        return normalized_errors
+
     def parse_file(self, file_path: Path | str) -> ParseResult:
         """Parse a Python source file into an Abstract Syntax Tree.
 
@@ -335,10 +405,29 @@ class PythonProcessor:
                 filename=str(path),
                 type_comments=True
             )
+        except (IndentationError, TabError) as e:
+            error_msg = format_error(
+                file_path=path,
+                line=getattr(e, "lineno", None),
+                column=getattr(e, "offset", None),
+                error_type=e.__class__.__name__,
+                message=getattr(e, "msg", str(e)),
+            )
+            logger.error(error_msg)
+            return ParseResult(
+                ast_node=None,
+                source_code=source_code,
+                file_path=path,
+                success=False,
+                errors=[error_msg]
+            )
         except SyntaxError as e:
-            error_msg = (
-                f"Syntax error in {path} at line {e.lineno}, "
-                f"column {e.offset}: {e.msg}"
+            error_msg = format_error(
+                file_path=path,
+                line=e.lineno,
+                column=e.offset,
+                error_type="SyntaxError",
+                message=e.msg,
             )
             logger.error(error_msg)
             return ParseResult(
@@ -349,7 +438,13 @@ class PythonProcessor:
                 errors=[error_msg]
             )
         except ValueError as e:
-            error_msg = f"Value error parsing {path}: {e}"
+            error_msg = format_error(
+                file_path=path,
+                line=0,
+                column=0,
+                error_type="ParseError",
+                message=f"Value error parsing source: {e}",
+            )
             logger.error(error_msg)
             return ParseResult(
                 ast_node=None,
@@ -366,18 +461,43 @@ class PythonProcessor:
         detector.visit(ast_node)
         warnings = detector.get_warnings()
 
+        config_options = getattr(self._config, "options", {}) or {}
+        graceful_degradation = bool(config_options.get("graceful_degradation", True))
+        blocking_warning_messages: list[str] = []
+
         # Log warnings by severity
         for warning in warnings:
-            log_message = (
-                f"{warning.file_path}:{warning.line_number}:{warning.column_offset} - "
-                f"{warning.feature_name}: {warning.description}"
+            structured_warning = UnsupportedFeatureWarning(
+                feature_name=warning.feature_name,
+                file_path=warning.file_path or path,
+                line_number=warning.line_number,
+                column_offset=warning.column_offset,
+                message=warning.description,
+                suggestion=warning.suggestion,
             )
-            if warning.severity == "critical":
-                logger.error(log_message)
-            elif warning.severity == "error":
-                logger.error(log_message)
-            elif warning.severity == "warning":
+            log_message = str(structured_warning)
+
+            if warning.severity in {"critical", "error"}:
+                blocking_warning_messages.append(log_message)
+                if graceful_degradation:
+                    logger.warning(log_message)
+                else:
+                    logger.error(log_message)
+            else:
                 logger.warning(log_message)
+
+        if blocking_warning_messages and not graceful_degradation:
+            logger.error(
+                f"Detected {len(blocking_warning_messages)} blocking unsupported feature(s) in {path}"
+            )
+            return ParseResult(
+                ast_node=None,
+                source_code=source_code,
+                file_path=path,
+                success=False,
+                errors=blocking_warning_messages,
+                warnings=warnings,
+            )
 
         # Log summary
         logger.info(f"Detected {len(warnings)} unsupported feature(s) in {path}")
@@ -647,20 +767,45 @@ class PythonProcessor:
                 transformer = NameManglingTransformer(symbol_table, path)
 
                 # Apply the transformation
-                result = transformer.transform(ast_node)
+                try:
+                    result = transformer.transform(ast_node)
+                except Exception as e:
+                    line, column = self._extract_exception_location(e, ast_node)
+                    structured_error = format_error(
+                        file_path=path,
+                        line=line,
+                        column=column,
+                        error_type="TransformationError",
+                        message=str(e),
+                    )
+                    logger.error(
+                        f"NameManglingTransformer failed for {path.name}: {structured_error}",
+                        exc_info=True,
+                    )
+                    return {
+                        "ast_node": ast_node,
+                        "success": False,
+                        "errors": [structured_error],
+                        "engine": None,
+                    }
 
                 if result.success:
                     logger.info(
                         f"Successfully obfuscated {path.name} using GlobalSymbolTable"
                     )
                 else:
+                    normalized_errors = self._normalize_transform_errors(
+                        result.errors,
+                        path,
+                        "TransformationError",
+                    )
                     logger.warning(
-                        f"Obfuscation of {path.name} completed with errors: {result.errors}"
+                        f"Obfuscation of {path.name} completed with errors: {normalized_errors}"
                     )
                     return {
                         "ast_node": ast_node,
                         "success": False,
-                        "errors": result.errors,
+                        "errors": normalized_errors,
                         "engine": None,
                     }
             else:
@@ -688,6 +833,17 @@ class PythonProcessor:
                     result.ast_node, "python", path
                 )
 
+                normalized_name_mangling_errors = self._normalize_transform_errors(
+                    result.errors,
+                    path,
+                    "TransformationError",
+                )
+                normalized_engine_errors = self._normalize_transform_errors(
+                    engine_result.errors,
+                    path,
+                    "TransformationError",
+                )
+
                 if engine_result.success:
                     logger.info(
                         f"Engine transformations succeeded for {path.name}: "
@@ -705,18 +861,18 @@ class PythonProcessor:
                     return {
                         "ast_node": final_ast,
                         "success": True,
-                        "errors": result.errors + engine_result.errors,
+                        "errors": normalized_name_mangling_errors + normalized_engine_errors,
                         "engine": self._current_engine,
                     }
                 else:
                     logger.error(
                         f"Engine transformations failed for {path.name}: "
-                        f"{engine_result.errors}"
+                        f"{normalized_engine_errors}"
                     )
                     return {
                         "ast_node": result.ast_node,
                         "success": False,
-                        "errors": result.errors + engine_result.errors,
+                        "errors": normalized_name_mangling_errors + normalized_engine_errors,
                         "engine": self._current_engine,
                     }
 
@@ -724,12 +880,23 @@ class PythonProcessor:
             return {
                 "ast_node": result.ast_node,
                 "success": result.success,
-                "errors": result.errors,
+                "errors": self._normalize_transform_errors(
+                    result.errors,
+                    path,
+                    "TransformationError",
+                ),
                 "engine": None,
             }
 
         except Exception as e:
-            error_msg = f"Failed to obfuscate {path}: {e}"
+            line, column = self._extract_exception_location(e, ast_node if isinstance(ast_node, ast.AST) else None)
+            error_msg = format_error(
+                file_path=path,
+                line=line,
+                column=column,
+                error_type="TransformationError",
+                message=f"Failed to obfuscate {path.name}: {e}",
+            )
             logger.error(error_msg, exc_info=True)
             return {
                 "ast_node": ast_node,
@@ -741,7 +908,8 @@ class PythonProcessor:
     def apply_transformations(
         self,
         ast_node: ast.Module,
-        transformers: list[ASTTransformer]
+        transformers: list[ASTTransformer],
+        file_path: Path | str | None = None,
     ) -> TransformationPipelineResult:
         """Apply a pipeline of AST transformations to a module.
 
@@ -821,21 +989,46 @@ class PythonProcessor:
         current_ast = ast_node
         total_transformations = 0
         all_errors: list[str] = []
+        path_for_errors = Path(file_path) if file_path is not None else Path("<unknown>")
 
         # Apply each transformer in sequence
         for idx, transformer in enumerate(transformers):
             logger.debug(f"Applying transformer {idx + 1}/{len(transformers)}: {type(transformer).__name__}")
 
             # Apply the transformation
-            transform_result: TransformResult = transformer.transform(current_ast)
+            try:
+                transform_result: TransformResult = transformer.transform(current_ast)
+            except Exception as e:
+                line, column = self._extract_exception_location(e, current_ast)
+                structured_error = format_error(
+                    file_path=path_for_errors,
+                    line=line,
+                    column=column,
+                    error_type=f"{type(transformer).__name__}Error",
+                    message=str(e),
+                )
+                logger.error(structured_error, exc_info=True)
+                all_errors.append(structured_error)
+                return TransformationPipelineResult(
+                    ast_node=None,
+                    success=False,
+                    total_transformations=total_transformations,
+                    errors=all_errors,
+                    validation_errors=[]
+                )
 
             if not transform_result.success:
+                normalized_errors = self._normalize_transform_errors(
+                    transform_result.errors,
+                    path_for_errors,
+                    f"{type(transformer).__name__}Error",
+                )
                 error_msg = (
                     f"Transformer {type(transformer).__name__} failed: "
-                    f"{', '.join(transform_result.errors)}"
+                    f"{', '.join(normalized_errors)}"
                 )
                 logger.error(error_msg)
-                all_errors.extend(transform_result.errors)
+                all_errors.extend(normalized_errors)
 
                 return TransformationPipelineResult(
                     ast_node=None,

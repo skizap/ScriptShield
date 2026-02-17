@@ -4,6 +4,17 @@ This module defines the ObfuscationConfig dataclass that represents
 obfuscation configuration profiles. It handles conversion between GUI
 feature names and JSON schema feature names, validation, and serialization.
 
+The configuration also includes multiprocessing controls for large projects:
+- ``enable_multiprocessing`` toggles parallel processing globally.
+- ``max_workers`` controls worker process count (or auto-detect when ``None``).
+- ``batch_size`` controls files processed per worker batch.
+- ``multiprocessing_threshold`` sets the minimum file count before parallel
+  processing is used.
+
+Disable multiprocessing when debugging transform behavior or when running in
+memory-constrained environments. Worker count and adaptive batch sizing remain
+auto-tuned by default.
+
 Example:
     Creating a configuration from GUI settings:
     
@@ -22,6 +33,7 @@ Example:
 
 from __future__ import annotations
 
+import multiprocessing
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any
 from pathlib import Path
@@ -71,6 +83,13 @@ VALID_FEATURES = {
 
 # Valid preset names
 VALID_PRESETS = {"light", "medium", "heavy", "maximum"}
+
+DEFAULT_MEMORY_THRESHOLD_PERCENT = 80
+DEFAULT_MIN_BATCH_SIZE = 25
+DEFAULT_ENABLE_MULTIPROCESSING = True
+DEFAULT_MAX_WORKERS: int | None = None
+DEFAULT_BATCH_SIZE = 75
+DEFAULT_MULTIPROCESSING_THRESHOLD = 100
 
 
 @dataclass
@@ -142,6 +161,12 @@ class ObfuscationConfig:
     })
     runtime_mode: str = "hybrid"
     conflict_strategy: str = "ask"
+    memory_threshold_percent: int = DEFAULT_MEMORY_THRESHOLD_PERCENT
+    min_batch_size: int = DEFAULT_MIN_BATCH_SIZE
+    enable_multiprocessing: bool = DEFAULT_ENABLE_MULTIPROCESSING  # Master switch for parallel processing. Disable for debugging or memory-constrained environments.
+    max_workers: int | None = DEFAULT_MAX_WORKERS  # Maximum worker processes. None = auto-detect (CPU count - 1, max 8).
+    batch_size: int = DEFAULT_BATCH_SIZE  # Files per batch. Auto-adjusted based on memory pressure during processing.
+    multiprocessing_threshold: int = DEFAULT_MULTIPROCESSING_THRESHOLD  # Minimum file count to trigger multiprocessing. Below this, sequential processing is used.
     
     def validate(self) -> None:
         """Validate the configuration.
@@ -180,6 +205,51 @@ class ObfuscationConfig:
             raise ValueError(
                 f"Invalid conflict_strategy: {self.conflict_strategy}. "
                 f"Expected one of {valid_conflict_strategies}"
+            )
+
+        if not 50 <= self.memory_threshold_percent <= 95:
+            raise ValueError(
+                "memory_threshold_percent must be between 50 and 95"
+            )
+
+        if not 10 <= self.min_batch_size <= 50:
+            raise ValueError("min_batch_size must be between 10 and 50")
+
+        if not isinstance(self.enable_multiprocessing, bool):
+            raise ValueError("enable_multiprocessing must be a boolean")
+
+        if self.max_workers is not None:
+            if not isinstance(self.max_workers, int) or isinstance(self.max_workers, bool):
+                raise ValueError("max_workers must be an integer or None")
+            if not 1 <= self.max_workers <= 16:
+                raise ValueError("max_workers must be between 1 and 16")
+
+            cpu_count = multiprocessing.cpu_count()
+            if self.max_workers > cpu_count:
+                logger.warning(
+                    "max_workers=%d exceeds available CPU cores (%d)",
+                    self.max_workers,
+                    cpu_count,
+                )
+
+        if not isinstance(self.batch_size, int) or isinstance(self.batch_size, bool):
+            raise ValueError("batch_size must be an integer")
+        if not 10 <= self.batch_size <= 200:
+            raise ValueError("batch_size must be between 10 and 200")
+        if self.batch_size < self.min_batch_size:
+            raise ValueError("batch_size must be greater than or equal to min_batch_size")
+
+        if (
+            not isinstance(self.multiprocessing_threshold, int)
+            or isinstance(self.multiprocessing_threshold, bool)
+        ):
+            raise ValueError("multiprocessing_threshold must be an integer")
+        if not 10 <= self.multiprocessing_threshold <= 1000:
+            raise ValueError("multiprocessing_threshold must be between 10 and 1000")
+        if self.multiprocessing_threshold < 50:
+            logger.warning(
+                "multiprocessing_threshold=%d is low and may add multiprocessing overhead",
+                self.multiprocessing_threshold,
             )
         
         # Check features
@@ -419,6 +489,12 @@ class ObfuscationConfig:
             "preset": self.preset,
             "runtime_mode": self.runtime_mode,
             "conflict_strategy": self.conflict_strategy,
+            "memory_threshold_percent": self.memory_threshold_percent,
+            "min_batch_size": self.min_batch_size,
+            "enable_multiprocessing": self.enable_multiprocessing,
+            "max_workers": self.max_workers,
+            "batch_size": self.batch_size,
+            "multiprocessing_threshold": self.multiprocessing_threshold,
             "features": self.features.copy(),
             "options": self.options.copy(),
             "symbol_table_options": self.symbol_table_options.copy(),
@@ -482,6 +558,21 @@ class ObfuscationConfig:
                 }),
                 runtime_mode=data.get("runtime_mode", "hybrid"),
                 conflict_strategy=data.get("conflict_strategy", "ask"),
+                memory_threshold_percent=data.get(
+                    "memory_threshold_percent",
+                    DEFAULT_MEMORY_THRESHOLD_PERCENT,
+                ),
+                min_batch_size=data.get("min_batch_size", DEFAULT_MIN_BATCH_SIZE),
+                enable_multiprocessing=data.get(
+                    "enable_multiprocessing",
+                    DEFAULT_ENABLE_MULTIPROCESSING,
+                ),
+                max_workers=data.get("max_workers", DEFAULT_MAX_WORKERS),
+                batch_size=data.get("batch_size", DEFAULT_BATCH_SIZE),
+                multiprocessing_threshold=data.get(
+                    "multiprocessing_threshold",
+                    DEFAULT_MULTIPROCESSING_THRESHOLD,
+                ),
             )
             logger.debug(f"Created configuration from dictionary: {config.name}")
             return config
@@ -494,7 +585,12 @@ class ObfuscationConfig:
         preset: Optional[str],
         features: Dict[str, bool],
         name: str,
-        language: str = "lua"
+        language: str = "lua",
+        enable_multiprocessing: bool = DEFAULT_ENABLE_MULTIPROCESSING,
+        max_workers: int | None = DEFAULT_MAX_WORKERS,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        multiprocessing_threshold: int = DEFAULT_MULTIPROCESSING_THRESHOLD,
+        memory_threshold_percent: int = DEFAULT_MEMORY_THRESHOLD_PERCENT,
     ) -> ObfuscationConfig:
         """Create configuration from GUI feature settings.
 
@@ -506,6 +602,11 @@ class ObfuscationConfig:
             features: Dictionary mapping GUI feature names to enabled state
             name: Profile name
             language: Target language (default: "lua")
+            enable_multiprocessing: Master multiprocessing toggle (default: True)
+            max_workers: Maximum worker process count, or None for auto-detect
+            batch_size: Initial multiprocessing batch size (default: 75)
+            multiprocessing_threshold: File-count threshold for parallel processing
+            memory_threshold_percent: Memory usage threshold for adaptive batch reduction
 
         Returns:
             ObfuscationConfig instance
@@ -558,6 +659,12 @@ class ObfuscationConfig:
             },
             runtime_mode="hybrid",
             conflict_strategy="ask",
+            memory_threshold_percent=memory_threshold_percent,
+            min_batch_size=DEFAULT_MIN_BATCH_SIZE,
+            enable_multiprocessing=enable_multiprocessing,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            multiprocessing_threshold=multiprocessing_threshold,
         )
 
         logger.debug(

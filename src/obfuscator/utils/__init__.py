@@ -53,6 +53,14 @@ from .logger import (
     VALID_LOG_LEVELS,
 )
 
+from .error_formatting import (
+    ERROR_FORMAT,
+    format_error,
+    parse_error,
+    has_location_info,
+    extract_line_column,
+)
+
 __all__ = [
     # Type alias
     "PathLike",
@@ -82,5 +90,11 @@ __all__ = [
     "add_console_handler",
     "get_log_directory",
     "VALID_LOG_LEVELS",
+    # Error formatting
+    "ERROR_FORMAT",
+    "format_error",
+    "parse_error",
+    "has_location_info",
+    "extract_line_column",
 ]
 

@@ -61,6 +61,7 @@ from obfuscator.processors.ast_transformer import (
 )
 from obfuscator.processors.python_processor import PythonProcessor
 from obfuscator.processors.lua_processor import LuaProcessor
+from obfuscator.utils.error_formatting import extract_line_column, format_error, parse_error
 from obfuscator.utils.logger import get_logger
 
 logger = get_logger("obfuscator.core.obfuscation_engine")
@@ -186,6 +187,39 @@ class ObfuscationEngine:
         )
         return transformers
 
+    def _extract_ast_node_location(self, node: Any) -> tuple[int | None, int | None]:
+        """Extract best-effort line/column data from a Python AST node."""
+        if not isinstance(node, ast.AST):
+            return None, None
+
+        line = getattr(node, "lineno", None)
+        column = getattr(node, "col_offset", None)
+        return line, column
+
+    def _extract_exception_location(
+        self,
+        exc: Exception,
+        fallback_node: Any = None,
+    ) -> tuple[int | None, int | None]:
+        """Extract line/column from exception metadata or traceback-local AST nodes."""
+        line = getattr(exc, "lineno", None)
+        column = getattr(exc, "offset", None)
+        if column is None:
+            column = getattr(exc, "col_offset", None)
+
+        if line is not None or column is not None:
+            return line, column
+
+        traceback_obj = exc.__traceback__
+        while traceback_obj is not None:
+            for value in traceback_obj.tb_frame.f_locals.values():
+                node_line, node_column = self._extract_ast_node_location(value)
+                if node_line is not None or node_column is not None:
+                    return node_line, node_column
+            traceback_obj = traceback_obj.tb_next
+
+        return self._extract_ast_node_location(fallback_node)
+
     def apply_transformations(
         self,
         ast_node: Any,
@@ -239,16 +273,69 @@ class ObfuscationEngine:
             logger.debug(
                 f"Applying transformer {idx + 1}/{len(transformers)}: {name}"
             )
+            logger.debug(
+                f"Transformer {name} processing file: {file_path}"
+            )
 
-            result = transformer.transform(current_ast)
+            try:
+                result = transformer.transform(current_ast)
+            except Exception as exc:
+                line, column = self._extract_exception_location(exc, current_ast)
+                structured_error = format_error(
+                    file_path=file_path,
+                    line=line,
+                    column=column,
+                    error_type=f"{name}Error",
+                    message=str(exc),
+                )
+                logger.error(
+                    f"Transformer {name} failed on {file_path}: {structured_error}",
+                    exc_info=True,
+                )
+                all_errors.append(structured_error)
+                return TransformResult(
+                    ast_node=None,
+                    success=False,
+                    transformation_count=total_count,
+                    errors=all_errors,
+                )
 
             if not result.success:
+                normalized_errors: list[str] = []
+                for error in result.errors:
+                    parsed = parse_error(error)
+                    if parsed is not None:
+                        normalized_errors.append(error)
+                        continue
+
+                    line, column = extract_line_column(error)
+                    normalized_errors.append(
+                        format_error(
+                            file_path=file_path,
+                            line=line,
+                            column=column,
+                            error_type=f"{name}Error",
+                            message=error,
+                        )
+                    )
+
+                if not normalized_errors:
+                    normalized_errors.append(
+                        format_error(
+                            file_path=file_path,
+                            line=0,
+                            column=0,
+                            error_type=f"{name}Error",
+                            message="Unknown transformation failure",
+                        )
+                    )
+
                 error_msg = (
                     f"Transformer {name} failed on {file_path.name}: "
-                    f"{', '.join(result.errors)}"
+                    f"{', '.join(normalized_errors)}"
                 )
                 logger.error(error_msg)
-                all_errors.extend(result.errors)
+                all_errors.extend(normalized_errors)
                 return TransformResult(
                     ast_node=None,
                     success=False,

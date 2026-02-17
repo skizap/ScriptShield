@@ -23,6 +23,7 @@ from obfuscator.core.dependency_graph import (
     DependencyNode,
     DependencyResolutionError,
 )
+from obfuscator.core.exceptions import UnsupportedFeatureWarning
 from obfuscator.core.profile_manager import ProfileManager
 
 __all__ = [
@@ -34,5 +35,6 @@ __all__ = [
     "DependencyAnalyzer",
     "CircularDependencyError",
     "DependencyResolutionError",
+    "UnsupportedFeatureWarning",
 ]
 

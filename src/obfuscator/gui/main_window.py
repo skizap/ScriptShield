@@ -21,17 +21,28 @@ from PyQt6.QtWidgets import (
 
 from obfuscator.gui.widgets import (
     ActionWidget,
+    CancellationConfirmDialog,
+    ErrorReportDialog,
     FileSelectionWidget,
     InfoPanelWidget,
     OutputWidget,
     ProfileWidget,
     ProgressWidget,
     SecurityConfigWidget,
+    StartConfirmationDialog,
 )
 
 from obfuscator.gui.styles.stylesheet import get_application_stylesheet
+from obfuscator.utils.error_formatting import extract_line_column, parse_error
 from obfuscator.utils.logger import get_logger
 from obfuscator.utils.path_utils import get_platform, normalize_path
+from obfuscator.core.config import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_MEMORY_THRESHOLD_PERCENT,
+    DEFAULT_MULTIPROCESSING_THRESHOLD,
+    ObfuscationConfig,
+)
 from obfuscator.core.orchestrator import ObfuscationOrchestrator, JobState, ErrorStrategy, ProgressInfo
 
 # Module-level logger
@@ -72,6 +83,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._center_window()
         self._current_orchestrator: ObfuscationOrchestrator | None = None
+        self._active_total_files: int = 0
 
         logger.info("MainWindow initialization complete")
 
@@ -232,6 +244,36 @@ class MainWindow(QMainWindow):
         self.output_widget.suggest_output_path(files)
         logger.debug(f"Files changed, count: {len(files)}, start enabled: {has_files}, triggering output auto-suggestion")
 
+    def _format_error_for_log(
+        self,
+        error: str,
+        fallback_file: str | Path | None = None,
+    ) -> tuple[str, str]:
+        """Format an error string for progress logs and infer log level by type."""
+        parsed_error = parse_error(error)
+        if parsed_error is not None:
+            error_type = str(parsed_error.get("error_type") or "Error")
+            file_name = Path(str(parsed_error.get("file_path") or "unknown")).name
+            line = int(parsed_error.get("line") or 0)
+            column = int(parsed_error.get("column") or 0)
+            message = str(parsed_error.get("message") or "Unknown error")
+            formatted = f"[ERROR] {file_name}:{line}:{column} - {error_type}: {message}"
+
+            if error_type in {"ParseError", "SyntaxError", "IndentationError", "TabError"}:
+                return formatted, "warning"
+            return formatted, "error"
+
+        line, column = extract_line_column(error)
+        fallback_name = Path(str(fallback_file)).name if fallback_file else None
+
+        if fallback_name and line is not None and column is not None:
+            return f"[ERROR] {fallback_name}:{line}:{column} - {error}", "error"
+        if fallback_name:
+            return f"[ERROR] {fallback_name} - {error}", "error"
+        if line is not None and column is not None:
+            return f"[ERROR] line {line}, column {column} - {error}", "error"
+        return f"[ERROR] {error}", "error"
+
     def _on_start_obfuscation(self) -> None:
         """Handle start obfuscation button click.
 
@@ -242,12 +284,63 @@ class MainWindow(QMainWindow):
         """
         files = self.file_selection.get_files()
         output_path = self.output_widget.get_output_path()
-        config = self.security_config.get_config()
+        security_config = self.security_config.get_config()
+
+        files_with_languages = self.file_selection.get_files_with_languages()
+        language = "lua"
+        if files_with_languages:
+            normalized_languages = {
+                str(file_language).lower()
+                for file_language in files_with_languages.values()
+            }
+            language = "python" if "python" in normalized_languages else "lua"
+        elif any(Path(file_path).suffix.lower() in {".py", ".pyw"} for file_path in files):
+            language = "python"
+
+        orchestrator_config = ObfuscationConfig.from_gui_config(
+            name="active-session",
+            preset=security_config.get("preset"),
+            features=security_config.get("features", {}),
+            language=language,
+            enable_multiprocessing=security_config.get("enable_multiprocessing", True),
+            max_workers=security_config.get("max_workers", DEFAULT_MAX_WORKERS),
+            batch_size=security_config.get("batch_size", DEFAULT_BATCH_SIZE),
+            multiprocessing_threshold=security_config.get(
+                "multiprocessing_threshold",
+                DEFAULT_MULTIPROCESSING_THRESHOLD,
+            ),
+            memory_threshold_percent=security_config.get(
+                "memory_threshold_percent",
+                DEFAULT_MEMORY_THRESHOLD_PERCENT,
+            ),
+        )
+        orchestrator_config.runtime_mode = security_config.get("runtime_mode", "hybrid")
 
         logger.info(
             f"Start obfuscation requested: {len(files)} files, "
-            f"output: {output_path}, preset: {config.get('preset')}"
+            f"output: {output_path}, preset: {security_config.get('preset')}, "
+            f"multiprocessing: {orchestrator_config.enable_multiprocessing}, "
+            f"max_workers: {orchestrator_config.max_workers}, "
+            f"batch_size: {orchestrator_config.batch_size}, "
+            f"parallel_threshold: {orchestrator_config.multiprocessing_threshold}, "
+            f"memory_threshold_percent: {orchestrator_config.memory_threshold_percent}"
         )
+
+        output_dir = Path(output_path) if output_path else Path.cwd() / "obfuscated"
+        preset = security_config.get("preset", "Unknown")
+        runtime_mode = security_config.get("runtime_mode", "hybrid")
+
+        dialog = StartConfirmationDialog(
+            file_count=len(files),
+            preset=preset,
+            output_path=output_dir,
+            runtime_mode=runtime_mode.capitalize(),
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.get_user_decision():
+            self.progress_widget.add_log_entry("Obfuscation cancelled by user", "warning")
+            self.action_widget.set_enabled(True)
+            return
 
         # Reset and show progress widget
         self.progress_widget.reset()
@@ -259,10 +352,10 @@ class MainWindow(QMainWindow):
 
         # Convert file paths to Path objects
         input_files = [Path(f) for f in files]
-        output_dir = Path(output_path) if output_path else Path.cwd() / "obfuscated"
+        self._active_total_files = len(files)
 
         # Early conflict detection before creating main orchestrator
-        temp_orchestrator = ObfuscationOrchestrator()
+        temp_orchestrator = ObfuscationOrchestrator(config=orchestrator_config)
         conflict_result = temp_orchestrator.detect_conflicts(input_files, output_dir)
 
         if conflict_result.has_conflicts:
@@ -290,6 +383,10 @@ class MainWindow(QMainWindow):
                 self.action_widget.set_enabled(True)
                 return
 
+        total_files = len(files)
+        BATCH_SIZE = 100
+        BATCH_THRESHOLD = 1000
+
         # Define progress callback for GUI updates
         def on_progress(progress_info: ProgressInfo) -> None:
             self.progress_widget.set_progress(int(progress_info.percentage))
@@ -298,6 +395,17 @@ class MainWindow(QMainWindow):
                 progress_info.elapsed_seconds,
                 progress_info.estimated_remaining_seconds,
             )
+            self.progress_widget.set_current_file(progress_info.current_file)
+
+            if total_files > BATCH_THRESHOLD:
+                non_file_step_count = max(progress_info.total_files - total_files, 0)
+                file_index = max(progress_info.current_index - non_file_step_count, 0)
+                total_batches = (total_files + BATCH_SIZE - 1) // BATCH_SIZE
+                current_batch = min((file_index // BATCH_SIZE) + 1, total_batches)
+                self.progress_widget.set_batch_info(current_batch, total_batches)
+            else:
+                self.progress_widget.set_batch_info(1, 1)
+
             self.progress_widget.add_log_entry(
                 progress_info.message,
                 progress_info.log_level or "info",
@@ -339,7 +447,7 @@ class MainWindow(QMainWindow):
 
         try:
             # Create orchestrator and apply conflict strategy if set
-            orchestrator = ObfuscationOrchestrator()
+            orchestrator = ObfuscationOrchestrator(config=orchestrator_config)
             self._current_orchestrator = orchestrator
             if conflict_result.has_conflicts:
                 # Copy the strategy from temp orchestrator
@@ -348,7 +456,7 @@ class MainWindow(QMainWindow):
             result = orchestrator.process_files(
                 input_files=input_files,
                 output_dir=output_dir,
-                config=config,
+                config=orchestrator_config.symbol_table_options,
                 progress_callback=on_progress,
                 error_callback=on_error,
                 error_strategy=ErrorStrategy.ASK
@@ -362,19 +470,23 @@ class MainWindow(QMainWindow):
                 self.progress_widget.add_log_entry(
                     f"Completed {completed_count}/{total_count} file(s) before cancellation", "info"
                 )
-                if result.warnings:
-                    for warning in result.warnings:
-                        self.progress_widget.add_log_entry(f"Warning: {warning}", "warning")
             # Report results
             # Always display errors first, regardless of success flag
             for error in result.errors:
-                self.progress_widget.add_log_entry(f"Error: {error}", "error")
+                formatted_error, level = self._format_error_for_log(error)
+                self.progress_widget.add_log_entry(formatted_error, level)
 
+            warning_count = len(result.warnings)
             if result.success:
                 success_count = sum(1 for pr in result.processed_files if pr.success)
-                self.progress_widget.add_log_entry(
+                completion_message = (
                     f"Obfuscation complete: {success_count}/{len(result.processed_files)} "
-                    f"files processed successfully",
+                    f"files processed successfully"
+                )
+                if warning_count > 0:
+                    completion_message += f", {warning_count} warning(s)"
+                self.progress_widget.add_log_entry(
+                    completion_message,
                     "success"
                 )
                 self.progress_widget.set_progress(100)
@@ -402,13 +514,18 @@ class MainWindow(QMainWindow):
                         failed_file = decision.get("file", "Unknown")
                         errors = decision.get("errors", [])
                         first_error = errors[0] if errors else "Unknown error"
-                        self.progress_widget.add_log_entry(
-                            f"  - {failed_file}: {first_error}", "error"
+                        formatted_error, level = self._format_error_for_log(
+                            first_error,
+                            fallback_file=failed_file,
                         )
+                        self.progress_widget.add_log_entry(f"  - {formatted_error}", level)
             else:
                 # Show a summary message for failures
+                failure_message = "Obfuscation completed with errors. See error messages above."
+                if warning_count > 0:
+                    failure_message += f" {warning_count} warning(s) detected."
                 self.progress_widget.add_log_entry(
-                    "Obfuscation completed with errors. See error messages above.",
+                    failure_message,
                     "error"
                 )
                 
@@ -422,13 +539,31 @@ class MainWindow(QMainWindow):
                         failed_file = decision.get("file", "Unknown")
                         errors = decision.get("errors", [])
                         first_error = errors[0] if errors else "Unknown error"
-                        self.progress_widget.add_log_entry(
-                            f"  - {failed_file}: {first_error}", "error"
+                        formatted_error, level = self._format_error_for_log(
+                            first_error,
+                            fallback_file=failed_file,
                         )
+                        self.progress_widget.add_log_entry(f"  - {formatted_error}", level)
 
-            # Log warnings
-            for warning in result.warnings:
-                self.progress_widget.add_log_entry(f"Warning: {warning}", "warning")
+            if warning_count > 0:
+                self.progress_widget.add_log_entry(
+                    f"{warning_count} warning(s) detected during processing",
+                    "warning",
+                )
+                for warning in result.warnings[:10]:
+                    self.progress_widget.add_log_entry(f"  {warning}", "warning")
+                if warning_count > 10:
+                    self.progress_widget.add_log_entry(
+                        f"  ... and {warning_count - 10} more warning(s)",
+                        "warning",
+                    )
+
+            if hasattr(result, "detailed_errors") and result.detailed_errors:
+                error_dialog = ErrorReportDialog(
+                    detailed_errors=result.detailed_errors,
+                    parent=self,
+                )
+                error_dialog.exec()
 
         except Exception as e:
             logger.error(f"Obfuscation failed: {e}", exc_info=True)
@@ -440,12 +575,37 @@ class MainWindow(QMainWindow):
             self.action_widget.set_enabled(has_files)
             # Clear orchestrator reference
             self._current_orchestrator = None
+            self._active_total_files = 0
 
     def _on_cancel_obfuscation(self) -> None:
         """Handle obfuscation cancellation request from user."""
         logger.info("Cancellation requested by user")
 
         if self._current_orchestrator is not None:
+            progress_percentage = self.progress_widget.get_progress()
+            total_count = self._active_total_files or len(self.file_selection.get_files())
+            completed_count = int((progress_percentage / 100) * total_count) if total_count > 0 else 0
+
+            current_file_text = self.progress_widget.current_file_label.text().strip()
+            current_file: str | None = None
+            if current_file_text.startswith("Current:"):
+                current_file = current_file_text.split(":", 1)[1].strip()
+            elif current_file_text:
+                current_file = current_file_text
+
+            if current_file in {"", "--", "N/A"}:
+                current_file = None
+
+            dialog = CancellationConfirmDialog(
+                completed_count=completed_count,
+                total_count=total_count,
+                current_file=current_file,
+                parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.get_user_decision():
+                self.progress_widget.add_log_entry("Cancellation aborted by user", "info")
+                return
+
             # Notify the orchestrator to cancel
             self._current_orchestrator.request_cancellation()
             logger.info("Cancellation requested - orchestrator notified")
@@ -527,6 +687,17 @@ class MainWindow(QMainWindow):
         preset = security_config.get("preset")
         features = security_config.get("features")
         runtime_mode = security_config.get("runtime_mode")
+        enable_multiprocessing = security_config.get("enable_multiprocessing", True)
+        max_workers = security_config.get("max_workers", DEFAULT_MAX_WORKERS)
+        batch_size = security_config.get("batch_size", DEFAULT_BATCH_SIZE)
+        multiprocessing_threshold = security_config.get(
+            "multiprocessing_threshold",
+            DEFAULT_MULTIPROCESSING_THRESHOLD,
+        )
+        memory_threshold_percent = security_config.get(
+            "memory_threshold_percent",
+            DEFAULT_MEMORY_THRESHOLD_PERCENT,
+        )
 
         if preset is None and not features:
             logger.error("Profile loaded but both preset and features are missing")
@@ -539,8 +710,27 @@ class MainWindow(QMainWindow):
 
         # Apply security configuration to widget
         try:
-            self.security_config.set_config(preset=preset, features=features, runtime_mode=runtime_mode)
-            logger.info(f"Profile loaded successfully - Preset: {preset}, Features: {len(features) if features else 0}, Runtime Mode: {runtime_mode}")
+            self.security_config.set_config(
+                preset=preset,
+                features=features,
+                runtime_mode=runtime_mode,
+                enable_multiprocessing=enable_multiprocessing,
+                max_workers=max_workers,
+                batch_size=batch_size,
+                multiprocessing_threshold=multiprocessing_threshold,
+                memory_threshold_percent=memory_threshold_percent,
+            )
+            logger.info(
+                "Profile loaded successfully - Preset: %s, Features: %d, Runtime Mode: %s, Multiprocessing: %s, Max Workers: %s, Batch Size: %s, Parallel Threshold: %s, Memory Threshold: %s",
+                preset,
+                len(features) if features else 0,
+                runtime_mode,
+                enable_multiprocessing,
+                max_workers,
+                batch_size,
+                multiprocessing_threshold,
+                memory_threshold_percent,
+            )
         except Exception as e:
             logger.error(f"Failed to apply security configuration: {e}")
             QMessageBox.critical(
