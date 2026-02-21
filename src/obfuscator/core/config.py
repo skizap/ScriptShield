@@ -167,6 +167,10 @@ class ObfuscationConfig:
     max_workers: int | None = DEFAULT_MAX_WORKERS  # Maximum worker processes. None = auto-detect (CPU count - 1, max 8).
     batch_size: int = DEFAULT_BATCH_SIZE  # Files per batch. Auto-adjusted based on memory pressure during processing.
     multiprocessing_threshold: int = DEFAULT_MULTIPROCESSING_THRESHOLD  # Minimum file count to trigger multiprocessing. Below this, sequential processing is used.
+    checkpoint_enabled: bool = True
+    checkpoint_interval_files: int = 100
+    checkpoint_interval_seconds: int = 300
+    checkpoint_dir: str | None = None
     
     def validate(self) -> None:
         """Validate the configuration.
@@ -251,6 +255,22 @@ class ObfuscationConfig:
                 "multiprocessing_threshold=%d is low and may add multiprocessing overhead",
                 self.multiprocessing_threshold,
             )
+            
+        if not isinstance(self.checkpoint_enabled, bool):
+            raise ValueError("checkpoint_enabled must be a boolean")
+            
+        if not isinstance(self.checkpoint_interval_files, int) or isinstance(self.checkpoint_interval_files, bool):
+            raise ValueError("checkpoint_interval_files must be an integer")
+        if not 1 <= self.checkpoint_interval_files <= 10000:
+            raise ValueError("checkpoint_interval_files must be between 1 and 10000")
+            
+        if not isinstance(self.checkpoint_interval_seconds, int) or isinstance(self.checkpoint_interval_seconds, bool):
+            raise ValueError("checkpoint_interval_seconds must be an integer")
+        if not 30 <= self.checkpoint_interval_seconds <= 86400:
+            raise ValueError("checkpoint_interval_seconds must be between 30 and 86400")
+            
+        if self.checkpoint_dir is not None and not isinstance(self.checkpoint_dir, str):
+            raise ValueError("checkpoint_dir must be a string or None")
         
         # Check features
         for feature_name in self.features:
@@ -495,6 +515,10 @@ class ObfuscationConfig:
             "max_workers": self.max_workers,
             "batch_size": self.batch_size,
             "multiprocessing_threshold": self.multiprocessing_threshold,
+            "checkpoint_enabled": self.checkpoint_enabled,
+            "checkpoint_interval_files": self.checkpoint_interval_files,
+            "checkpoint_interval_seconds": self.checkpoint_interval_seconds,
+            "checkpoint_dir": self.checkpoint_dir,
             "features": self.features.copy(),
             "options": self.options.copy(),
             "symbol_table_options": self.symbol_table_options.copy(),
@@ -573,6 +597,10 @@ class ObfuscationConfig:
                     "multiprocessing_threshold",
                     DEFAULT_MULTIPROCESSING_THRESHOLD,
                 ),
+                checkpoint_enabled=data.get("checkpoint_enabled", True),
+                checkpoint_interval_files=data.get("checkpoint_interval_files", 100),
+                checkpoint_interval_seconds=data.get("checkpoint_interval_seconds", 300),
+                checkpoint_dir=data.get("checkpoint_dir", None),
             )
             logger.debug(f"Created configuration from dictionary: {config.name}")
             return config

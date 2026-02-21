@@ -70,6 +70,8 @@ import multiprocessing
 import os
 import re
 import time
+import uuid
+import hashlib
 from collections import defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -107,6 +109,7 @@ from obfuscator.core.worker import (
     process_file_batch,
     set_cancellation_event,
 )
+from obfuscator.core.__init__ import CheckpointManager
 from obfuscator.core.exceptions import UnsupportedFeatureWarning
 from obfuscator.utils.error_formatting import extract_line_column, parse_error
 from obfuscator.utils.logger import get_logger
@@ -450,6 +453,9 @@ class ObfuscationOrchestrator:
         self._file_processing_times: list[float] = []
         self._parallel_processing_metadata: dict[str, Any] = {}
         self._active_pool_manager: ProcessPoolManager | None = None
+        self._session_id: str = str(uuid.uuid4())
+        self._last_checkpoint_time: float | None = None
+        self._checkpoint_manager: CheckpointManager | None = None
 
     def _transition_state(self, new_state: JobState, result: OrchestrationResult) -> None:
         """Transition the orchestrator to a new state.
@@ -917,6 +923,119 @@ class ObfuscationOrchestrator:
             self._logger.warning(f"Unknown conflict strategy: {effective_strategy}, defaulting to overwrite")
             return output_path
 
+    def resume_from_checkpoint(
+        self,
+        checkpoint_path: Path,
+        input_files: list[Path],
+        output_dir: Path,
+        config: dict[str, Any] | None = None,
+        progress_callback: Callable[[ProgressInfo], None] | None = None,
+        project_root: Path | None = None,
+        error_callback: Callable[[Path, list[str]], bool] | None = None,
+        error_strategy: ErrorStrategy = ErrorStrategy.CONTINUE,
+        generate_summary: bool = False,
+    ) -> OrchestrationResult:
+        """Resume obfuscation from a previous checkpoint.
+        
+        Args:
+            checkpoint_path: Path to the checkpoint file to restore
+            input_files: Original list of input files
+            output_dir: Target output directory
+            config: Obfuscation configuration overrides
+            progress_callback: Optional progress callback
+            project_root: Optional project root
+            error_callback: Optional error callback
+            error_strategy: Strategy for handling errors
+            generate_summary: Whether to generate a summary report
+            
+        Returns:
+            OrchestrationResult for the resumed job
+        """
+        # Resolve checkpoint directory and instantiate CheckpointManager
+        if self._config is not None and self._config.checkpoint_dir is not None:
+            checkpoint_dir = Path(self._config.checkpoint_dir)
+        else:
+            checkpoint_dir = output_dir / ".checkpoints"
+            
+        self._checkpoint_manager = CheckpointManager(checkpoint_dir)
+        
+        try:
+            data = self._checkpoint_manager.restore_checkpoint(checkpoint_path)
+            self._logger.info(f"Successfully restored checkpoint from {checkpoint_path}")
+        except (ValueError, FileNotFoundError) as e:
+            self._logger.error(f"Failed to restore checkpoint: {e}")
+            raise
+            
+        # Reconstruct state from checkpoint
+        graph = DependencyGraph.from_dict(data["state"]["dependency_graph"])
+        global_table = GlobalSymbolTable.from_dict(data["state"]["symbol_table"])
+        stored_hashes: dict[str, str] = data["state"]["processed_file_hashes"]
+        
+        # Restore instance state from checkpoint
+        self._dependency_graph = graph
+        self._global_symbol_table = global_table
+        self._session_id = data["state"]["session_id"]
+        
+        # Filter input files that were already successfully processed
+        remaining_files = []
+        skipped_count = 0
+        
+        for path in input_files:
+            path_str = str(path.resolve())
+            if path_str in stored_hashes:
+                try:
+                    # Only skip if the input file hash hasn't changed since it was processed
+                    # Note: We are checking the input file hash against the stored hash
+                    # Wait, the prompt says: "compute _compute_file_hash(path) and exclude it if stored_hashes.get(str(path.resolve())) == computed_hash"
+                    # But actually we stored the hash of the *output* file in step 3e.
+                    # The prompt explicitly says:
+                    # "Filter input_files: for each path, compute _compute_file_hash(path) and exclude it if stored_hashes.get(str(path.resolve())) == computed_hash"
+                    # We should follow the prompt exactly for the implementation.
+                    computed_hash = self._compute_file_hash(path)
+                    if stored_hashes.get(path_str) == computed_hash:
+                        skipped_count += 1
+                        continue
+                except OSError:
+                    pass
+            remaining_files.append(path)
+            
+        self._logger.info(
+            f"Resuming job {self._session_id}: skipping {skipped_count} files, "
+            f"resuming with {len(remaining_files)} remaining files"
+        )
+        
+        # Process the remaining files
+        # Note: we need to pass the restored graph and global_table to process_files, 
+        # but process_files doesn't accept them as arguments.
+        # We need to modify process_files to accept them, or we need to monkey-patch
+        # them in, or we need to just return the result of process_files.
+        # The prompt says: "Call process_files(...) and return its result."
+        # This implies process_files will re-analyze the remaining files.
+        # Wait, the prompt says "Reconstruct graph... Reconstruct global_table... Call process_files(...)".
+        # If we just call process_files, it will start from VALIDATING -> ANALYZING and build a new graph.
+        # We should modify process_files to accept the restored state, or set them as instance variables.
+        # Wait, the instructions didn't mention modifying process_files signature.
+        # Let's check the prompt again:
+        # "Call process_files(remaining_files, output_dir, config, progress_callback, project_root, error_callback, error_strategy, generate_summary) and return its result."
+        # OK, I will just call process_files as requested. It will process the remaining_files.
+        # The reconstructed graph and global_table might not be used if process_files re-analyzes them, 
+        # but the prompt asked to do it exactly this way. I will follow the plan verbatim.
+        
+        return self.process_files(
+            input_files=remaining_files,
+            output_dir=output_dir,
+            config=config,
+            progress_callback=progress_callback,
+            project_root=project_root,
+            error_callback=error_callback,
+            error_strategy=error_strategy,
+            generate_summary=generate_summary,
+            resume_graph=graph,
+            resume_table=global_table,
+            resume_hashes=stored_hashes,
+            resume_state=JobState.PROCESSING,
+        )
+
     def process_files(
         self,
         input_files: list[Path],
@@ -927,6 +1046,10 @@ class ObfuscationOrchestrator:
         error_callback: Callable[[Path, list[str]], bool] | None = None,
         error_strategy: ErrorStrategy = ErrorStrategy.CONTINUE,
         generate_summary: bool = False,
+        resume_graph: DependencyGraph | None = None,
+        resume_table: GlobalSymbolTable | None = None,
+        resume_hashes: dict[str, str] | None = None,
+        resume_state: JobState = JobState.PROCESSING,
     ) -> OrchestrationResult:
         """Process multiple files with dependency-aware obfuscation.
 
@@ -1035,14 +1158,65 @@ class ObfuscationOrchestrator:
         self._parallel_processing_metadata = {}
         self._active_pool_manager = None
         result = OrchestrationResult(success=True)
-        # 5 pre-file phases: validation, conflict detection, scanning,
-        # dependency build, symbol-table build — plus one step per file
-        total_steps = 5 + len(input_files)
-        current_step = 0
-        num_input_files = len(input_files)
-
-        # Initialize state to PENDING
-        self._transition_state(JobState.PENDING, result)
+        
+        # Handle resume case: skip VALIDATING/ANALYZING and use restored state
+        if resume_graph is not None and resume_table is not None:
+            self._transition_state(resume_state, result)
+            graph = resume_graph
+            global_table = resume_table
+            processed_file_hashes = resume_hashes.copy() if resume_hashes else {}
+            self._project_root = project_root
+            
+            # Use processing order from remaining files (already filtered by resume_from_checkpoint)
+            try:
+                processing_order = graph.get_processing_order()
+                # Filter to only files in input_files
+                input_set = set(f.resolve() for f in input_files)
+                processing_order = [p for p in processing_order if p.resolve() in input_set]
+            except Exception:
+                processing_order = list(input_files)
+            
+            result.dependency_graph = graph
+            result.global_symbol_table = global_table
+            result.metadata["total_files_planned"] = len(input_files)
+            
+            # Initialize checkpoint manager for resumed session
+            if self._config is not None and self._config.checkpoint_dir is not None:
+                checkpoint_dir = Path(self._config.checkpoint_dir)
+            else:
+                checkpoint_dir = output_dir / ".checkpoints"
+            self._checkpoint_manager = CheckpointManager(checkpoint_dir)
+            self._last_checkpoint_time = time.time()
+            
+            # Skip directly to processing phase
+            successfully_parsed = set(input_files)
+            use_multiprocessing = (
+                resolved_enable_multiprocessing
+                and len(processing_order) >= resolved_parallel_threshold
+            )
+            
+            # Set up step accounting for resume
+            if use_multiprocessing:
+                estimated_batches = max(
+                    1,
+                    (len(processing_order) + resolved_parallel_batch_size - 1)
+                    // resolved_parallel_batch_size,
+                )
+                total_steps = estimated_batches
+            else:
+                total_steps = len(input_files)
+            current_step = 0
+            num_input_files = len(input_files)
+            
+            # Resume-continue directly to processing loop below
+        else:
+            # Normal flow: 5 pre-file phases plus file processing
+            total_steps = 5 + len(input_files)
+            current_step = 0
+            num_input_files = len(input_files)
+            
+            # Initialize state to PENDING
+            self._transition_state(JobState.PENDING, result)
 
         def _build_progress_info(
             message: str,
@@ -1096,170 +1270,203 @@ class ObfuscationOrchestrator:
             logger_method = getattr(self._logger, effective_log_level, self._logger.info)
             logger_method(message)
 
-        # Transition to VALIDATING and validate inputs before processing
-        self._transition_state(JobState.VALIDATING, result)
-        report_progress("Validating inputs...")
-        validation_result = self.validate_inputs(input_files, output_dir)
+        # Normal flow: VALIDATING -> ANALYZING -> PROCESSING
+        if resume_graph is None or resume_table is None:
+            # Transition to VALIDATING and validate inputs before processing
+            self._transition_state(JobState.VALIDATING, result)
+            report_progress("Validating inputs...")
+            validation_result = self.validate_inputs(input_files, output_dir)
 
-        if not validation_result.success:
-            result.success = False
-            result.errors.extend(validation_result.errors)
-            result.warnings.extend(validation_result.warnings)
-            self._logger.error(f"Input validation failed with {len(validation_result.errors)} error(s)")
-            # Transition to FAILED before returning
-            self._transition_state(JobState.FAILED, result)
-            return result
-
-        # Add any validation warnings to result
-        if validation_result.warnings:
-            result.warnings.extend(validation_result.warnings)
-
-        # Conflict detection after validation succeeds
-        report_progress("Checking for file conflicts...")
-        conflict_result = self.detect_conflicts(input_files, output_dir, project_root)
-
-        if conflict_result.has_conflicts:
-            conflict_count = len(conflict_result.conflicts)
-
-            if self._conflict_strategy == ConflictStrategy.ASK:
-                # Return early with conflicts info for GUI to handle
+            if not validation_result.success:
                 result.success = False
-                result.errors.append(
-                    "File conflicts detected. Please resolve conflicts before proceeding."
-                )
-                result.metadata["conflicts"] = conflict_result.conflicts
-                result.metadata["conflicts_detected"] = conflict_count
-                result.metadata["conflict_strategy"] = self._conflict_strategy.value
-                self._logger.warning(
-                    f"Detected {conflict_count} file conflict(s) - returning for GUI resolution"
-                )
+                result.errors.extend(validation_result.errors)
+                result.warnings.extend(validation_result.warnings)
+                self._logger.error(f"Input validation failed with {len(validation_result.errors)} error(s)")
+                # Transition to FAILED before returning
                 self._transition_state(JobState.FAILED, result)
                 return result
 
-            elif self._conflict_strategy == ConflictStrategy.SKIP:
-                result.warnings.append(
-                    f"{conflict_count} file(s) will be skipped due to conflicts"
-                )
-                self._logger.info(f"{conflict_count} file(s) will be skipped")
+            # Add any validation warnings to result
+            if validation_result.warnings:
+                result.warnings.extend(validation_result.warnings)
 
-            elif self._conflict_strategy == ConflictStrategy.RENAME:
-                result.warnings.append(
-                    f"{conflict_count} file(s) will be renamed to avoid conflicts"
-                )
-                self._logger.info(f"{conflict_count} file(s) will be renamed")
+            # Conflict detection after validation succeeds
+            report_progress("Checking for file conflicts...")
+            conflict_result = self.detect_conflicts(input_files, output_dir, project_root)
 
-            elif self._conflict_strategy == ConflictStrategy.OVERWRITE:
-                result.warnings.append(
-                    f"{conflict_count} existing file(s) will be overwritten"
-                )
-                self._logger.info(f"{conflict_count} existing file(s) will be overwritten")
+            if conflict_result.has_conflicts:
+                conflict_count = len(conflict_result.conflicts)
 
-        # Compute project root from all input files if not explicitly provided
-        if project_root is None and input_files:
-            resolved_paths = [f.resolve() for f in input_files]
+                if self._conflict_strategy == ConflictStrategy.ASK:
+                    # Return early with conflicts info for GUI to handle
+                    result.success = False
+                    result.errors.append(
+                        "File conflicts detected. Please resolve conflicts before proceeding."
+                    )
+                    result.metadata["conflicts"] = conflict_result.conflicts
+                    result.metadata["conflicts_detected"] = conflict_count
+                    result.metadata["conflict_strategy"] = self._conflict_strategy.value
+                    self._logger.warning(
+                        f"Detected {conflict_count} file conflict(s) - returning for GUI resolution"
+                    )
+                    self._transition_state(JobState.FAILED, result)
+                    return result
+
+                elif self._conflict_strategy == ConflictStrategy.SKIP:
+                    result.warnings.append(
+                        f"{conflict_count} file(s) will be skipped due to conflicts"
+                    )
+                    self._logger.info(f"{conflict_count} file(s) will be skipped")
+
+                elif self._conflict_strategy == ConflictStrategy.RENAME:
+                    result.warnings.append(
+                        f"{conflict_count} file(s) will be renamed to avoid conflicts"
+                    )
+                    self._logger.info(f"{conflict_count} file(s) will be renamed")
+
+                elif self._conflict_strategy == ConflictStrategy.OVERWRITE:
+                    result.warnings.append(
+                        f"{conflict_count} existing file(s) will be overwritten"
+                    )
+                    self._logger.info(f"{conflict_count} existing file(s) will be overwritten")
+
+            # Compute project root from all input files if not explicitly provided
+            if project_root is None and input_files:
+                resolved_paths = [f.resolve() for f in input_files]
+                try:
+                    common_path = Path(os.path.commonpath(resolved_paths))
+                    # If common path is a file, use its parent directory
+                    project_root = common_path if common_path.is_dir() else common_path.parent
+                    self._logger.info(f"Computed project root from input files: {project_root}")
+                except ValueError:
+                    # commonpath raises ValueError if paths are on different drives (Windows)
+                    project_root = Path.cwd()
+                    self._logger.warning(
+                        "Could not compute common path from input files, using cwd as project root"
+                    )
+
+            # Store project_root for use in _process_file_in_order
+            self._project_root = project_root
+
             try:
-                common_path = Path(os.path.commonpath(resolved_paths))
-                # If common path is a file, use its parent directory
-                project_root = common_path if common_path.is_dir() else common_path.parent
-                self._logger.info(f"Computed project root from input files: {project_root}")
-            except ValueError:
-                # commonpath raises ValueError if paths are on different drives (Windows)
-                project_root = Path.cwd()
-                self._logger.warning(
-                    "Could not compute common path from input files, using cwd as project root"
+                output_writer = OutputWriter(
+                    output_dir=output_dir,
+                    conflict_strategy=self._conflict_strategy,
+                    use_atomic_writes=True,
+                    conflict_callback=None,
                 )
 
-        # Store project_root for use in _process_file_in_order
-        self._project_root = project_root
+                # Transition to ANALYZING for scan and symbol extraction
+                self._transition_state(JobState.ANALYZING, result)
 
-        try:
+                # Phase 1: Scan and extract symbols (ASTs are discarded to bound memory)
+                report_progress("Scanning files and extracting symbols...")
+                successfully_parsed, symbol_tables = self._scan_and_extract_symbols(
+                    input_files, result
+                )
+
+                if not successfully_parsed:
+                    result.success = False
+                    result.errors.append("No files were successfully parsed")
+                    # Transition to FAILED before returning
+                    self._transition_state(JobState.FAILED, result)
+                    return result
+
+                # Phase 2: Build dependency graph and symbol table
+                report_progress("Building dependency graph...")
+                graph = self._build_dependency_graph(
+                    successfully_parsed, symbol_tables, config, result, project_root
+                )
+                result.dependency_graph = graph
+
+                report_progress("Pre-computing symbol table...")
+                global_table = self._build_global_symbol_table(
+                    graph, symbol_tables, config, result
+                )
+                result.global_symbol_table = global_table
+                
+                # Initial checkpoint after ANALYZING phase
+                result.metadata["total_files_planned"] = len(successfully_parsed)
+                self._save_checkpoint(graph, global_table, {}, result, emit_log=emit_log)
+
+                # Phase 3: Process files in topological order (re-parsing just-in-time)
+                try:
+                    processing_order = graph.get_processing_order()
+                except CircularDependencyError as e:
+                    result.success = False
+                    result.errors.append(f"Circular dependency detected: {e.message}")
+                    result.warnings.append(
+                        "Processing files in original order due to circular dependencies"
+                    )
+                    processing_order = list(successfully_parsed)
+
+                use_multiprocessing = (
+                    resolved_enable_multiprocessing
+                    and len(processing_order) >= resolved_parallel_threshold
+                )
+                if use_multiprocessing:
+                    estimated_batches = max(
+                        1,
+                        (len(processing_order) + resolved_parallel_batch_size - 1)
+                        // resolved_parallel_batch_size,
+                    )
+                    total_steps = 5 + estimated_batches
+                    worker_count = (
+                        resolved_max_workers
+                        if resolved_max_workers is not None
+                        else max(1, min(multiprocessing.cpu_count() - 1, 8))
+                    )
+                    self._logger.info(
+                        "Processing %d files using multiprocessing (%d workers, batch size %d)",
+                        len(processing_order),
+                        worker_count,
+                        resolved_parallel_batch_size,
+                    )
+                else:
+                    if not resolved_enable_multiprocessing:
+                        self._logger.info(
+                            "Processing %d files sequentially (multiprocessing disabled by configuration)",
+                            len(processing_order),
+                        )
+                    else:
+                        self._logger.info(
+                            "Processing %d files sequentially (below multiprocessing threshold: %d)",
+                            len(processing_order),
+                            resolved_parallel_threshold,
+                        )
+
+                # Ensure output directory exists
+                output_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Resolve checkpoint directory and instantiate CheckpointManager
+                if self._config is not None and self._config.checkpoint_dir is not None:
+                    checkpoint_dir = Path(self._config.checkpoint_dir)
+                else:
+                    checkpoint_dir = output_dir / ".checkpoints"
+                self._checkpoint_manager = CheckpointManager(checkpoint_dir)
+                self._last_checkpoint_time = time.time()
+
+                # Transition to PROCESSING before file processing loop
+                self._transition_state(JobState.PROCESSING, result)
+            except Exception as e:
+                result.success = False
+                result.errors.append(f"Orchestration failed: {e}")
+                self._logger.error(f"Orchestration failed: {e}", exc_info=True)
+                # Transition to FAILED on exception
+                self._transition_state(JobState.FAILED, result)
+                emit_log("Job failed")
+                return result
+        else:
+            # Resume flow: already set up graph, table, processing_order, etc.
+            # Transition to PROCESSING for resumed session
+            self._transition_state(JobState.PROCESSING, result)
             output_writer = OutputWriter(
                 output_dir=output_dir,
                 conflict_strategy=self._conflict_strategy,
                 use_atomic_writes=True,
                 conflict_callback=None,
             )
-
-            # Transition to ANALYZING for scan and symbol extraction
-            self._transition_state(JobState.ANALYZING, result)
-
-            # Phase 1: Scan and extract symbols (ASTs are discarded to bound memory)
-            report_progress("Scanning files and extracting symbols...")
-            successfully_parsed, symbol_tables = self._scan_and_extract_symbols(
-                input_files, result
-            )
-
-            if not successfully_parsed:
-                result.success = False
-                result.errors.append("No files were successfully parsed")
-                # Transition to FAILED before returning
-                self._transition_state(JobState.FAILED, result)
-                return result
-
-            # Phase 2: Build dependency graph and symbol table
-            report_progress("Building dependency graph...")
-            graph = self._build_dependency_graph(
-                successfully_parsed, symbol_tables, config, result, project_root
-            )
-            result.dependency_graph = graph
-
-            report_progress("Pre-computing symbol table...")
-            global_table = self._build_global_symbol_table(
-                graph, symbol_tables, config, result
-            )
-            result.global_symbol_table = global_table
-
-            # Phase 3: Process files in topological order (re-parsing just-in-time)
-            try:
-                processing_order = graph.get_processing_order()
-            except CircularDependencyError as e:
-                result.success = False
-                result.errors.append(f"Circular dependency detected: {e.message}")
-                result.warnings.append(
-                    "Processing files in original order due to circular dependencies"
-                )
-                processing_order = list(successfully_parsed)
-
-            use_multiprocessing = (
-                resolved_enable_multiprocessing
-                and len(processing_order) >= resolved_parallel_threshold
-            )
-            if use_multiprocessing:
-                estimated_batches = max(
-                    1,
-                    (len(processing_order) + resolved_parallel_batch_size - 1)
-                    // resolved_parallel_batch_size,
-                )
-                total_steps = 5 + estimated_batches
-                worker_count = (
-                    resolved_max_workers
-                    if resolved_max_workers is not None
-                    else max(1, min(multiprocessing.cpu_count() - 1, 8))
-                )
-                self._logger.info(
-                    "Processing %d files using multiprocessing (%d workers, batch size %d)",
-                    len(processing_order),
-                    worker_count,
-                    resolved_parallel_batch_size,
-                )
-            else:
-                if not resolved_enable_multiprocessing:
-                    self._logger.info(
-                        "Processing %d files sequentially (multiprocessing disabled by configuration)",
-                        len(processing_order),
-                    )
-                else:
-                    self._logger.info(
-                        "Processing %d files sequentially (below multiprocessing threshold: %d)",
-                        len(processing_order),
-                        resolved_parallel_threshold,
-                    )
-
-            # Ensure output directory exists
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            # Transition to PROCESSING before file processing loop
-            self._transition_state(JobState.PROCESSING, result)
+            emit_log(f"Resuming job {self._session_id} with {len(input_files)} remaining files")
 
             # Check for cancellation before starting the loop
             if self._check_cancellation():
@@ -1286,6 +1493,7 @@ class ObfuscationOrchestrator:
             parallel_batch_count = 0
             parallel_batch_size = 0
             parallel_batch_times: list[float] = []
+            processed_file_hashes: dict[str, str] = {}
 
             if use_multiprocessing:
                 processed_start = len(result.processed_files)
@@ -1304,6 +1512,8 @@ class ObfuscationOrchestrator:
                         progress_callback=progress_callback,
                         emit_log=emit_log,
                         error_callback=error_callback,
+                        processed_file_hashes=processed_file_hashes,
+                        checkpoint_callback=self._save_checkpoint,
                         max_workers=resolved_max_workers,
                         batch_size=resolved_parallel_batch_size,
                     )
@@ -1379,65 +1589,119 @@ class ObfuscationOrchestrator:
                     report_progress(f"Processing {file_path.name}...", current_file=file_path.name)
                     # Re-parse file just-in-time (AST not cached)
                     file_start_time = time.time()
-                    process_result = self._process_file_in_order(
-                        file_path,
-                        global_table,
-                        output_dir,
-                        config,
-                        output_writer,
-                        emit_log_callback=emit_log,
-                    )
-                    self._file_processing_times.append(time.time() - file_start_time)
-                    result.processed_files.append(process_result)
-
-                    if process_result.warnings:
-                        result.warnings.extend(process_result.warnings)
-                        warnings_by_file[str(file_path)].extend(process_result.warnings)
-
-                    if process_result.detailed_errors:
-                        result.detailed_errors.extend(process_result.detailed_errors)
-
-                    if not process_result.success:
-                        # Append all per-file errors to the orchestration result
-                        result.errors.extend(process_result.errors)
-
-                        # Report all error messages via progress callback
-                        if process_result.errors:
-                            joined_errors = "; ".join(process_result.errors)
-                            error_msg = f"Error processing {file_path.name}: {joined_errors}"
-                        else:
-                            error_msg = f"Error processing {file_path.name}: Unknown error"
-                        emit_log(error_msg, current_file=file_path.name)
-
-                        # Handle error based on strategy
-                        should_continue = self.handle_processing_error(
+                    try:
+                        process_result = self._process_file_in_order(
                             file_path,
-                            process_result.errors,
-                            error_callback
+                            global_table,
+                            output_dir,
+                            config,
+                            output_writer,
+                            emit_log_callback=emit_log,
                         )
-
-                        # Track error decision in metadata
-                        if "error_decisions" not in result.metadata:
-                            result.metadata["error_decisions"] = []
-                        if "files_failed_with_errors" not in result.metadata:
-                            result.metadata["files_failed_with_errors"] = []
-
-                        decision = "continue" if should_continue else "stop"
-                        result.metadata["error_decisions"].append({
-                            "file": str(file_path),
-                            "errors": process_result.errors,
-                            "decision": decision
-                        })
-                        result.metadata["files_failed_with_errors"].append(str(file_path))
-
-                        # Report user decision
-                        emit_log(f"User chose to {decision} after error", current_file=file_path.name)
-
-                        # Break loop if user chose to stop
+                        file_elapsed = time.time() - file_start_time
+                        self._file_processing_times.append(file_elapsed)
+                        
+                        if process_result.warnings:
+                            result.warnings.extend(process_result.warnings)
+                            warnings_by_file[str(process_result.file_path)].extend(
+                                process_result.warnings
+                            )
+                        
+                        if process_result.detailed_errors:
+                            result.detailed_errors.extend(process_result.detailed_errors)
+                            
+                        result.processed_files.append(process_result)
+                        
+                        if process_result.success:
+                            total_success += 1
+                            processed_file_hashes[str(process_result.file_path.resolve())] = self._compute_file_hash(process_result.file_path)
+                            
+                            # Checkpoint logic
+                            checkpoint_files = self._config.checkpoint_interval_files if self._config else 100
+                            checkpoint_seconds = self._config.checkpoint_interval_seconds if self._config else 300
+                            if (len(processed_file_hashes) % checkpoint_files == 0 or
+                                time.time() - self._last_checkpoint_time >= checkpoint_seconds):
+                                self._save_checkpoint(graph, global_table, processed_file_hashes, result, emit_log)
+                        else:
+                            result.errors.extend(process_result.errors)
+                            
+                            # Log and check strategy
+                            joined_errors = "; ".join(process_result.errors) if process_result.errors else "Unknown error"
+                            emit_log(
+                                f"Error processing {process_result.file_path.name}: {joined_errors}",
+                                current_file=process_result.file_path.name,
+                                log_level="error",
+                            )
+                            
+                            should_continue = self.handle_processing_error(
+                                file_path=process_result.file_path,
+                                errors=process_result.errors,
+                                error_callback=error_callback,
+                            )
+                            
+                            if not should_continue:
+                                result.success = False
+                                self._transition_state(JobState.FAILED, result)
+                                
+                                result.metadata["halted_by_error_strategy"] = self._error_strategy.value
+                                result.metadata["halted_on_file"] = str(process_result.file_path)
+                                result.metadata["halted_on_errors"] = list(process_result.errors)
+                                
+                                current_idx = processing_order.index(file_path)
+                                skipped = [str(p) for p in processing_order[current_idx + 1:]]
+                                result.metadata["files_skipped_due_to_error_strategy"] = skipped
+                                break
+                    
+                    except Exception as e:
+                        file_elapsed = time.time() - file_start_time
+                        self._file_processing_times.append(file_elapsed)
+                        
+                        error_msg = f"Unexpected error processing {file_path}: {e}"
+                        self._logger.error(error_msg, exc_info=True)
+                        result.errors.append(error_msg)
+                        
+                        process_result = ProcessResult(
+                            file_path=file_path,
+                            output_path=None,
+                            success=False,
+                            errors=[error_msg],
+                            detailed_errors=[
+                                self._create_detailed_error(
+                                    file_path=file_path,
+                                    error_type=type(e).__name__,
+                                    message=str(e),
+                                )
+                            ],
+                        )
+                        result.processed_files.append(process_result)
+                        result.detailed_errors.extend(process_result.detailed_errors)
+                        
+                        emit_log(
+                            error_msg,
+                            current_file=file_path.name,
+                            log_level="error",
+                        )
+                        
+                        should_continue = self.handle_processing_error(
+                            file_path=file_path,
+                            errors=[error_msg],
+                            error_callback=error_callback,
+                        )
+                        
                         if not should_continue:
-                            self._transition_state(JobState.FAILED, result)
                             result.success = False
+                            self._transition_state(JobState.FAILED, result)
+                            
+                            result.metadata["halted_by_error_strategy"] = self._error_strategy.value
+                            result.metadata["halted_on_file"] = str(file_path)
+                            result.metadata["halted_on_errors"] = [error_msg]
+                            
+                            current_idx = processing_order.index(file_path)
+                            skipped = [str(p) for p in processing_order[current_idx + 1:]]
+                            result.metadata["files_skipped_due_to_error_strategy"] = skipped
                             break
+                            
+                    report_progress(f"Processed {file_path.name}", current_file=file_path.name)
 
             # Update overall success based on individual results
             failed_count = sum(
@@ -1526,6 +1790,9 @@ class ObfuscationOrchestrator:
             if result.success and result.current_state != JobState.FAILED:
                 self._transition_state(JobState.COMPLETED, result)
                 emit_log("Job completed")
+                
+                if self._checkpoint_manager is not None and self._config and self._config.checkpoint_enabled:
+                    self._checkpoint_manager.cleanup_checkpoints(self._session_id)
 
             # Generate hybrid runtime files if in hybrid mode using OutputWriter
             if self._config is not None and self._config.runtime_mode == "hybrid":
@@ -1655,14 +1922,6 @@ class ObfuscationOrchestrator:
             }
             result.metadata["output_writer_warnings"] = list(writer_metadata.warnings)
 
-        except Exception as e:
-            result.success = False
-            result.errors.append(f"Orchestration failed: {e}")
-            self._logger.error(f"Orchestration failed: {e}", exc_info=True)
-            # Transition to FAILED on exception
-            self._transition_state(JobState.FAILED, result)
-            emit_log("Job failed")
-
         return result
 
     def _convert_worker_result_to_process_result(
@@ -1712,6 +1971,8 @@ class ObfuscationOrchestrator:
         progress_callback: Callable[[ProgressInfo], None] | None,
         emit_log: Callable[[str, str | None, str], None],
         error_callback: Callable[[Path, list[str]], bool] | None,
+        processed_file_hashes: dict[str, str],
+        checkpoint_callback: Callable[[DependencyGraph, GlobalSymbolTable, dict[str, str], OrchestrationResult, Callable | None], None],
         max_workers: int | None = None,
         batch_size: int = DEFAULT_PARALLEL_BATCH_SIZE,
     ) -> None:
@@ -1864,13 +2125,8 @@ class ObfuscationOrchestrator:
                     log_level="info",
                 )
 
-                batches = pool_manager.create_batches(
-                    processing_order,
-                    pool_manager.batch_size,
-                )
+                # Use iter_batches for sequential submit/collect/checkpoint pattern
                 batch_size_used = pool_manager.current_batch_size
-                total_batches = len(batches)
-                batch_count = total_batches
                 batch_size_adjustments = list(pool_manager.batch_size_adjustments)
 
                 if batch_size_adjustments:
@@ -1888,30 +2144,21 @@ class ObfuscationOrchestrator:
                     )
 
                 emit_log(
-                    f"Created {total_batches} batches from {len(processing_order)} files",
+                    f"Processing {len(processing_order)} files using interleaved batching",
                     log_level="info",
                 )
 
-                if total_batches == 0:
-                    self._parallel_processing_metadata = {
-                        "worker_count": worker_count_used,
-                        "batch_count": batch_count,
-                        "batch_size": batch_size_used,
-                        "batch_size_adjustments": batch_size_adjustments,
-                        "batch_times_seconds": batch_times,
-                        "warnings_by_file": {},
-                        "cancelled_files": [],
-                        "cancelled_uncollected_batches": [],
-                    }
-                    return
+                # Process batches one at a time: submit, collect, checkpoint
+                batch_count = 0
+                total_batches_estimate = max(1, len(processing_order) // batch_size_used)
 
-                pending_async_results: dict[int, AsyncResult] = {}
-                batch_start_times: dict[int, float] = {}
-                results_by_batch: dict[int, list[WorkerResult]] = {}
-
-                for batch_index, batch in enumerate(batches, start=1):
+                for batch_index, batch in pool_manager.iter_batches(
+                    processing_order, pool_manager.batch_size
+                ):
+                    batch_count += 1
                     task_id = f"batch-{batch_index}"
 
+                    # Check for cancellation before submitting
                     if self._check_cancellation():
                         if not cancellation_detected:
                             cancellation_detected = True
@@ -1924,10 +2171,16 @@ class ObfuscationOrchestrator:
                                 log_level="warning",
                             )
 
-                        results_by_batch[batch_index] = build_batch_cancelled_results(
+                        # Emit cancelled results for remaining files in this batch
+                        cancelled_results = build_batch_cancelled_results(
                             task_id=task_id,
                             batch_paths=batch,
                         )
+                        for worker_result in cancelled_results:
+                            process_result = self._convert_worker_result_to_process_result(worker_result)
+                            result.processed_files.append(process_result)
+                            cancelled_files.append(str(process_result.file_path))
+                            
                         batch_times.append(0.0)
                         cancelled_uncollected_batches.append(batch_index)
                         emit_log(
@@ -1936,6 +2189,8 @@ class ObfuscationOrchestrator:
                         )
                         continue
 
+                    # Submit batch
+                    batch_start = time.time()
                     try:
                         task = WorkerTask(
                             task_id=task_id,
@@ -1948,11 +2203,10 @@ class ObfuscationOrchestrator:
                             runtime_mode=runtime_mode,
                             conflict_strategy=self._conflict_strategy.value,
                         )
-                        pending_async_results[batch_index] = pool_manager.submit_batch(task)
-                        batch_start_times[batch_index] = time.time()
-                        self._logger.info("Submitted batch %d/%d", batch_index, total_batches)
+                        async_result = pool_manager.submit_batch(task)
+                        self._logger.info("Submitted batch %d", batch_index)
                         emit_log(
-                            f"Processing batch {batch_index}/{total_batches} ({len(batch)} files)...",
+                            f"Processing batch {batch_index} ({len(batch)} files)...",
                             log_level="info",
                         )
                     except Exception as submission_error:
@@ -1961,9 +2215,8 @@ class ObfuscationOrchestrator:
                             f"{type(submission_error).__name__}: {submission_error}"
                         )
                         self._logger.warning(
-                            "Failed to submit batch %d/%d: %s",
+                            "Failed to submit batch %d: %s",
                             batch_index,
-                            total_batches,
                             submission_error,
                             exc_info=True,
                         )
@@ -1973,160 +2226,243 @@ class ObfuscationOrchestrator:
                             log_level="warning",
                         )
 
-                        results_by_batch[batch_index] = build_batch_failure_results(
+                        # Emit failure results for all files in batch
+                        failure_results = build_batch_failure_results(
                             task_id=task_id,
                             batch_paths=batch,
                             error_message=error_message,
                         )
+                        for worker_result in failure_results:
+                            process_result = self._convert_worker_result_to_process_result(worker_result)
+                            result.processed_files.append(process_result)
+                            result.errors.extend(process_result.errors)
+                            result.detailed_errors.extend(process_result.detailed_errors)
+
                         batch_times.append(0.0)
                         emit_log(
                             f"Batch {batch_index} completed: 0/{len(batch)} files succeeded",
                             log_level="progress_step",
                         )
+                        continue
 
-                pending_batch_ids = set(pending_async_results.keys())
-                while pending_batch_ids:
-                    if self._check_cancellation() and not cancellation_detected:
-                        cancellation_detected = True
-                        cancellation_started_at = time.time()
-                        result.success = False
-                        self._transition_state(JobState.CANCELLED, result)
-                        pool_manager.signal_cancellation()
-                        emit_log(
-                            "Cancellation requested; waiting for in-flight workers to finish current files",
-                            log_level="warning",
-                        )
-
-                    made_progress = False
-
-                    for batch_index in sorted(list(pending_batch_ids)):
-                        async_result = pending_async_results[batch_index]
-                        if not async_result.ready():
-                            continue
-
-                        batch = batches[batch_index - 1]
-                        elapsed = time.time() - batch_start_times.get(batch_index, time.time())
-                        batch_times.append(elapsed)
-
+                    # Collect results immediately (blocking wait with timeout)
+                    try:
                         batch_results = pool_manager.collect_results(
                             [async_result],
-                            timeout=0.1,
+                            timeout=DEFAULT_BATCH_TIMEOUT_SECONDS,
                         )
-
-                        if not batch_results:
-                            if cancellation_detected:
-                                batch_results = build_batch_cancelled_results(
-                                    task_id=f"batch-{batch_index}",
-                                    batch_paths=batch,
-                                )
-                            else:
-                                error_message = "Batch completed without returning worker results"
-                                self._logger.warning(
-                                    "Batch %d returned no results; synthesizing failures",
-                                    batch_index,
-                                )
-                                batch_results = build_batch_failure_results(
-                                    task_id=f"batch-{batch_index}",
-                                    batch_paths=batch,
-                                    error_message=error_message,
-                                    processing_time=elapsed,
-                                )
-
-                        results_by_batch[batch_index] = batch_results
-                        pending_batch_ids.remove(batch_index)
-                        made_progress = True
-
-                        success_count = sum(1 for batch_result in batch_results if batch_result.success)
-                        cancelled_count = sum(
-                            1 for batch_result in batch_results if batch_result.was_cancelled
-                        )
-                        processed_count = len(batch_results) - cancelled_count
-
-                        batch_summary = (
-                            f"Batch {batch_index} completed: {success_count}/{processed_count} "
-                            "files succeeded"
-                        )
-                        if cancelled_count > 0:
-                            batch_summary += f" ({cancelled_count} skipped due to cancellation)"
-
-                        emit_log(batch_summary, log_level="progress_step")
-                        self._logger.info(
-                            "Batch %d completed in %.2fs (processed=%d, cancelled=%d)",
-                            batch_index,
-                            elapsed,
-                            processed_count,
-                            cancelled_count,
-                        )
-
-                    now = time.time()
-
-                    if cancellation_detected and cancellation_started_at is not None:
-                        cancellation_elapsed = now - cancellation_started_at
-                        if cancellation_elapsed >= pool_manager.grace_period and pending_batch_ids:
-                            force_message = (
-                                "Cancellation grace period exceeded "
-                                f"({pool_manager.grace_period:.1f}s); forcing worker shutdown"
+                    except TimeoutError:
+                        if cancellation_detected:
+                            batch_results = build_batch_cancelled_results(
+                                task_id=task_id,
+                                batch_paths=batch,
                             )
-                            self._logger.warning(force_message)
-                            emit_log(force_message, log_level="warning")
-
-                            if pool_manager.pool is not None:
-                                pool_manager.shutdown_pool(grace_period=pool_manager.grace_period)
-                                graceful_shutdown_invoked = True
-
-                            for remaining_batch_index in sorted(list(pending_batch_ids)):
-                                remaining_batch = batches[remaining_batch_index - 1]
-                                remaining_elapsed = (
-                                    now - batch_start_times.get(remaining_batch_index, now)
-                                )
-                                batch_times.append(max(0.0, remaining_elapsed))
-                                results_by_batch[remaining_batch_index] = (
-                                    build_batch_cancelled_results(
-                                        task_id=f"batch-{remaining_batch_index}",
-                                        batch_paths=remaining_batch,
-                                    )
-                                )
-                                cancelled_uncollected_batches.append(remaining_batch_index)
-                                pending_batch_ids.remove(remaining_batch_index)
-                                emit_log(
-                                    (
-                                        f"Batch {remaining_batch_index} completed: 0/0 files "
-                                        f"succeeded ({len(remaining_batch)} skipped due to cancellation)"
-                                    ),
-                                    log_level="progress_step",
-                                )
-                            continue
-
-                    for batch_index in sorted(list(pending_batch_ids)):
-                        elapsed = now - batch_start_times.get(batch_index, now)
-                        if elapsed <= DEFAULT_BATCH_TIMEOUT_SECONDS:
-                            continue
-
-                        batch = batches[batch_index - 1]
-                        timeout_message = (
-                            f"Batch {batch_index} timed out after {elapsed:.1f}s "
-                            f"(limit={DEFAULT_BATCH_TIMEOUT_SECONDS:.1f}s)"
-                        )
-                        self._logger.error(timeout_message)
-                        emit_log(timeout_message, log_level="warning")
-
-                        results_by_batch[batch_index] = build_batch_failure_results(
-                            task_id=f"batch-{batch_index}",
+                        else:
+                            elapsed = time.time() - batch_start
+                            timeout_message = (
+                                f"Batch {batch_index} timed out after {elapsed:.1f}s "
+                                f"(limit={DEFAULT_BATCH_TIMEOUT_SECONDS:.1f}s)"
+                            )
+                            self._logger.error(timeout_message)
+                            emit_log(timeout_message, log_level="warning")
+                            batch_results = build_batch_failure_results(
+                                task_id=task_id,
+                                batch_paths=batch,
+                                error_message=timeout_message,
+                                processing_time=elapsed,
+                            )
+                    except Exception as collect_error:
+                        elapsed = time.time() - batch_start
+                        error_message = f"Failed to collect batch results: {collect_error}"
+                        self._logger.error(error_message, exc_info=True)
+                        batch_results = build_batch_failure_results(
+                            task_id=task_id,
                             batch_paths=batch,
-                            error_message=timeout_message,
+                            error_message=error_message,
                             processing_time=elapsed,
                         )
-                        batch_times.append(elapsed)
-                        pending_batch_ids.remove(batch_index)
-                        made_progress = True
 
-                        emit_log(
-                            f"Batch {batch_index} completed: 0/{len(batch)} files succeeded",
-                            log_level="progress_step",
+                    # Process batch results
+                    elapsed = time.time() - batch_start
+                    batch_times.append(elapsed)
+
+                    if not batch_results:
+                        # No results returned - treat as failure
+                        batch_results = build_batch_failure_results(
+                            task_id=task_id,
+                            batch_paths=batch,
+                            error_message="Batch returned no results",
+                            processing_time=elapsed,
                         )
 
-                    if not made_progress and pending_batch_ids:
-                        time.sleep(0.2 if cancellation_detected else 0.5)
+                    success_count = 0
+                    cancelled_count = 0
+                    for worker_result in batch_results:
+                        process_result = self._convert_worker_result_to_process_result(worker_result)
+                        result.processed_files.append(process_result)
+                        self._file_processing_times.append(float(worker_result.processing_time))
+                        worker_transformation_counts[str(process_result.file_path)] = int(
+                            worker_result.transformation_count
+                        )
+
+                        if process_result.warnings:
+                            result.warnings.extend(process_result.warnings)
+                            warnings_by_file[str(process_result.file_path)].extend(
+                                process_result.warnings
+                            )
+
+                        if process_result.detailed_errors:
+                            result.detailed_errors.extend(process_result.detailed_errors)
+
+                        if process_result.was_cancelled:
+                            cancelled_count += 1
+                            cancelled_files.append(str(process_result.file_path))
+                            continue
+
+                        if process_result.success:
+                            success_count += 1
+                            total_success += 1
+                            processed_file_hashes[str(process_result.file_path.resolve())] = self._compute_file_hash(process_result.file_path)
+                            continue
+
+                        # Handle error
+                        result.errors.extend(process_result.errors)
+                        joined_errors = "; ".join(process_result.errors) if process_result.errors else "Unknown error"
+                        emit_log(
+                            f"Error processing {process_result.file_path.name}: {joined_errors}",
+                            current_file=process_result.file_path.name,
+                            log_level="error",
+                        )
+
+                        if self._error_strategy not in {ErrorStrategy.STOP, ErrorStrategy.ASK}:
+                            continue
+
+                        if "error_decisions" not in result.metadata:
+                            result.metadata["error_decisions"] = []
+                        if "files_failed_with_errors" not in result.metadata:
+                            result.metadata["files_failed_with_errors"] = []
+
+                        should_continue = False
+                        decision = "stop"
+
+                        if self._error_strategy == ErrorStrategy.STOP:
+                            self._logger.error(
+                                "Error processing %s. Halting multiprocessing (STOP strategy).",
+                                process_result.file_path.name,
+                            )
+                        elif error_callback is None:
+                            callback_missing_message = (
+                                "ErrorStrategy.ASK requires error_callback during multiprocessing; "
+                                f"defaulting to STOP after error in {process_result.file_path.name}"
+                            )
+                            self._logger.error(callback_missing_message)
+                            emit_log(
+                                callback_missing_message,
+                                current_file=process_result.file_path.name,
+                                log_level="error",
+                            )
+                        else:
+                            self._logger.info(
+                                "Error processing %s. Prompting user for decision (ASK strategy).",
+                                process_result.file_path.name,
+                            )
+                            try:
+                                should_continue = bool(
+                                    error_callback(process_result.file_path, process_result.errors)
+                                )
+                            except Exception as callback_error:
+                                callback_error_message = (
+                                    "Error callback raised exception during multiprocessing: "
+                                    f"{type(callback_error).__name__}: {callback_error}"
+                                )
+                                self._logger.error(callback_error_message, exc_info=True)
+                                result.errors.append(callback_error_message)
+                                emit_log(
+                                    callback_error_message,
+                                    current_file=process_result.file_path.name,
+                                    log_level="error",
+                                )
+                                should_continue = False
+
+                            decision = "continue" if should_continue else "stop"
+                            self._logger.info(
+                                "User chose to %s after error in %s",
+                                decision,
+                                process_result.file_path.name,
+                            )
+                            emit_log(
+                                f"User chose to {decision} after error",
+                                current_file=process_result.file_path.name,
+                            )
+
+                        result.metadata["error_decisions"].append(
+                            {
+                                "file": str(process_result.file_path),
+                                "errors": list(process_result.errors),
+                                "decision": decision,
+                            }
+                        )
+                        result.metadata["files_failed_with_errors"].append(
+                            str(process_result.file_path)
+                        )
+
+                        if should_continue:
+                            continue
+
+                        halted_due_to_worker_errors = True
+                        result.success = False
+                        self._transition_state(JobState.FAILED, result)
+
+                        # Mark remaining files in current and future batches as skipped
+                        remaining_in_batch = len(batch_results) - batch_results.index(worker_result) - 1
+                        skipped_due_to_halt.extend([
+                            str(Path(r.file_path)) for r in batch_results[batch_results.index(worker_result) + 1:]
+                        ])
+
+                        result.metadata["halted_due_to_worker_errors"] = True
+                        result.metadata["halted_by_error_strategy"] = self._error_strategy.value
+                        result.metadata["halted_on_file"] = str(process_result.file_path)
+                        result.metadata["halted_on_errors"] = list(process_result.errors)
+
+                        emit_log(
+                            f"Halting multiprocessing due to worker error in {process_result.file_path.name}",
+                            current_file=process_result.file_path.name,
+                            log_level="error",
+                        )
+
+                        if pool_manager.pool is not None:
+                            pool_manager.terminate_pool()
+
+                        break  # Break out of batch results processing
+
+                    if halted_due_to_worker_errors:
+                        break  # Break out of batch iteration loop
+
+                    processed_count = len(batch_results) - cancelled_count
+                    batch_summary = (
+                        f"Batch {batch_index} completed: {success_count}/{processed_count} "
+                        "files succeeded"
+                    )
+                    if cancelled_count > 0:
+                        batch_summary += f" ({cancelled_count} skipped due to cancellation)"
+
+                    emit_log(batch_summary, log_level="progress_step")
+                    self._logger.info(
+                        "Batch %d completed in %.2fs (processed=%d, cancelled=%d)",
+                        batch_index,
+                        elapsed,
+                        processed_count,
+                        cancelled_count,
+                    )
+
+                    # Checkpoint after each batch
+                    checkpoint_files = self._config.checkpoint_interval_files if self._config else 100
+                    checkpoint_seconds = self._config.checkpoint_interval_seconds if self._config else 300
+                    if (len(processed_file_hashes) % checkpoint_files == 0 or
+                        time.time() - self._last_checkpoint_time >= checkpoint_seconds):
+                        checkpoint_callback(graph, global_table, processed_file_hashes, result, emit_log)
+
+                # End of batch iteration loop
 
                 if (
                     cancellation_detected
@@ -2135,161 +2471,6 @@ class ObfuscationOrchestrator:
                 ):
                     pool_manager.shutdown_pool(grace_period=pool_manager.grace_period)
                     graceful_shutdown_invoked = True
-
-                worker_results: list[WorkerResult] = []
-                for batch_index in range(1, total_batches + 1):
-                    batch_results = results_by_batch.get(batch_index)
-                    if batch_results is None:
-                        batch = batches[batch_index - 1]
-                        if cancellation_detected:
-                            batch_results = build_batch_cancelled_results(
-                                task_id=f"batch-{batch_index}",
-                                batch_paths=batch,
-                            )
-                            cancelled_uncollected_batches.append(batch_index)
-                        else:
-                            error_message = f"Batch {batch_index} was not processed"
-                            batch_results = build_batch_failure_results(
-                                task_id=f"batch-{batch_index}",
-                                batch_paths=batch,
-                                error_message=error_message,
-                            )
-                    worker_results.extend(batch_results)
-
-                for worker_index, worker_result in enumerate(worker_results):
-                    process_result = self._convert_worker_result_to_process_result(worker_result)
-                    result.processed_files.append(process_result)
-                    self._file_processing_times.append(float(worker_result.processing_time))
-                    worker_transformation_counts[str(process_result.file_path)] = int(
-                        worker_result.transformation_count
-                    )
-
-                    if process_result.warnings:
-                        result.warnings.extend(process_result.warnings)
-                        warnings_by_file[str(process_result.file_path)].extend(
-                            process_result.warnings
-                        )
-
-                    if process_result.detailed_errors:
-                        result.detailed_errors.extend(process_result.detailed_errors)
-
-                    if process_result.was_cancelled:
-                        cancelled_files.append(str(process_result.file_path))
-                        continue
-
-                    if process_result.success:
-                        total_success += 1
-                        continue
-
-                    result.errors.extend(process_result.errors)
-                    joined_errors = "; ".join(process_result.errors) if process_result.errors else "Unknown error"
-                    emit_log(
-                        f"Error processing {process_result.file_path.name}: {joined_errors}",
-                        current_file=process_result.file_path.name,
-                        log_level="error",
-                    )
-
-                    if self._error_strategy not in {ErrorStrategy.STOP, ErrorStrategy.ASK}:
-                        continue
-
-                    if "error_decisions" not in result.metadata:
-                        result.metadata["error_decisions"] = []
-                    if "files_failed_with_errors" not in result.metadata:
-                        result.metadata["files_failed_with_errors"] = []
-
-                    should_continue = False
-                    decision = "stop"
-
-                    if self._error_strategy == ErrorStrategy.STOP:
-                        self._logger.error(
-                            "Error processing %s. Halting multiprocessing (STOP strategy).",
-                            process_result.file_path.name,
-                        )
-                    elif error_callback is None:
-                        callback_missing_message = (
-                            "ErrorStrategy.ASK requires error_callback during multiprocessing; "
-                            f"defaulting to STOP after error in {process_result.file_path.name}"
-                        )
-                        self._logger.error(callback_missing_message)
-                        emit_log(
-                            callback_missing_message,
-                            current_file=process_result.file_path.name,
-                            log_level="error",
-                        )
-                    else:
-                        self._logger.info(
-                            "Error processing %s. Prompting user for decision (ASK strategy).",
-                            process_result.file_path.name,
-                        )
-                        try:
-                            should_continue = bool(
-                                error_callback(process_result.file_path, process_result.errors)
-                            )
-                        except Exception as callback_error:
-                            callback_error_message = (
-                                "Error callback raised exception during multiprocessing: "
-                                f"{type(callback_error).__name__}: {callback_error}"
-                            )
-                            self._logger.error(callback_error_message, exc_info=True)
-                            result.errors.append(callback_error_message)
-                            emit_log(
-                                callback_error_message,
-                                current_file=process_result.file_path.name,
-                                log_level="error",
-                            )
-                            should_continue = False
-
-                        decision = "continue" if should_continue else "stop"
-                        self._logger.info(
-                            "User chose to %s after error in %s",
-                            decision,
-                            process_result.file_path.name,
-                        )
-                        emit_log(
-                            f"User chose to {decision} after error",
-                            current_file=process_result.file_path.name,
-                        )
-
-                    result.metadata["error_decisions"].append(
-                        {
-                            "file": str(process_result.file_path),
-                            "errors": list(process_result.errors),
-                            "decision": decision,
-                        }
-                    )
-                    result.metadata["files_failed_with_errors"].append(
-                        str(process_result.file_path)
-                    )
-
-                    if should_continue:
-                        continue
-
-                    halted_due_to_worker_errors = True
-                    result.success = False
-                    self._transition_state(JobState.FAILED, result)
-
-                    remaining_results = worker_results[worker_index + 1 :]
-                    skipped_due_to_halt = [
-                        str(Path(remaining_result.file_path))
-                        for remaining_result in remaining_results
-                    ]
-
-                    result.metadata["halted_due_to_worker_errors"] = True
-                    result.metadata["halted_by_error_strategy"] = self._error_strategy.value
-                    result.metadata["halted_on_file"] = str(process_result.file_path)
-                    result.metadata["halted_on_errors"] = list(process_result.errors)
-                    result.metadata["files_skipped_due_to_error_strategy"] = skipped_due_to_halt
-
-                    emit_log(
-                        f"Halting multiprocessing due to worker error in {process_result.file_path.name}",
-                        current_file=process_result.file_path.name,
-                        log_level="error",
-                    )
-
-                    if pool_manager.pool is not None:
-                        pool_manager.terminate_pool()
-
-                    break
         finally:
             self._active_pool_manager = None
 
@@ -2460,6 +2641,69 @@ class ObfuscationOrchestrator:
                 graph.add_node(path, language, [], exports)
 
         return graph
+
+    def _compute_file_hash(self, file_path: Path) -> str:
+        """Compute SHA-256 hash of a file's content.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            Hex string of the SHA-256 hash
+        """
+        with open(file_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def _save_checkpoint(
+        self,
+        graph: DependencyGraph,
+        global_table: GlobalSymbolTable,
+        processed_file_hashes: dict[str, str],
+        result: OrchestrationResult,
+        emit_log: Callable[[str, str | None, str], None] | None = None
+    ) -> None:
+        """Save a checkpoint if enabled and interval reached.
+
+        Args:
+            graph: The current dependency graph
+            global_table: The current global symbol table
+            processed_file_hashes: Dict of processed file paths to their hashes
+            result: Current orchestration result
+            emit_log: Optional callback for logging progress
+        """
+        if self._config is None or not self._config.checkpoint_enabled or self._checkpoint_manager is None:
+            return
+
+        progress = {
+            "files_completed": len(processed_file_hashes),
+            "total_files": result.metadata.get("total_files_planned", 0) or len(processed_file_hashes),
+        }
+        if progress["total_files"] > 0:
+            progress["percentage"] = (progress["files_completed"] / progress["total_files"]) * 100
+        else:
+            progress["percentage"] = 0.0
+
+        job_state = {
+            "session_id": self._session_id,
+            "progress": progress,
+            "dependency_graph": graph.to_dict(),
+            "symbol_table": global_table.to_dict(),
+            "processed_file_hashes": processed_file_hashes.copy(),
+            "errors": result.errors.copy()
+        }
+
+        try:
+            self._checkpoint_manager.create_checkpoint(job_state)
+            self._last_checkpoint_time = time.time()
+            if emit_log:
+                emit_log(
+                    f"Checkpoint saved ({len(processed_file_hashes)} files completed)",
+                    log_level="info"
+                )
+            else:
+                self._logger.info(f"Checkpoint saved ({len(processed_file_hashes)} files completed)")
+        except Exception as e:
+            self._logger.error(f"Failed to save checkpoint: {e}", exc_info=True)
 
     def _build_global_symbol_table(
         self,
@@ -3676,6 +3920,31 @@ class ProcessPoolManager:
             len(self.batch_size_adjustments),
         )
         return batches
+
+    def iter_batches(
+        self,
+        file_paths: list[Path],
+        requested_batch_size: int,
+    ):
+        """Yield batches one at a time for sequential processing with checkpointing.
+
+        This generator yields (batch_index, batch_paths) tuples, allowing
+        caller to submit, collect, and checkpoint after each batch.
+        """
+        if not 10 <= requested_batch_size <= 200:
+            raise ValueError("batch_size must be between 10 and 200")
+
+        if not file_paths:
+            return
+
+        self.current_batch_size = requested_batch_size
+        self._check_and_adjust_batch_size(len(file_paths))
+
+        batch_index = 0
+        for index in range(0, len(file_paths), self.current_batch_size):
+            batch_index += 1
+            batch = file_paths[index:index + self.current_batch_size]
+            yield batch_index, batch
 
     def submit_batch(self, task: WorkerTask) -> AsyncResult:
         """Submit a batch task to the process pool."""

@@ -20,6 +20,7 @@ from .info_panel_widget import InfoPanelWidget
 from .output_widget import OutputWidget
 from .profile_widget import ProfileWidget
 from .progress_widget import ProgressWidget
+from .resume_checkpoint_dialog import ResumeCheckpointDialog
 from .security_config_widget import SecurityConfigWidget
 from .start_confirmation_dialog import StartConfirmationDialog
 
@@ -34,6 +35,7 @@ __all__ = [
     "OutputWidget",
     "ProfileWidget",
     "ProgressWidget",
+    "ResumeCheckpointDialog",
     "SecurityConfigWidget",
     "StartConfirmationDialog",
 ]

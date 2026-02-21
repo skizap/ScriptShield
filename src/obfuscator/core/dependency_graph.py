@@ -431,8 +431,56 @@ class DependencyGraph:
                 for edge in self.edges
             ],
             "node_count": len(self.nodes),
-            "edge_count": len(self.edges)
+            "edge_count": len(self.edges),
+            "adjacency_list": {
+                str(path): [str(dep) for dep in deps]
+                for path, deps in self.adjacency_list.items()
+            },
+            "reverse_adjacency": {
+                str(path): [str(dep) for dep in deps]
+                for path, deps in self.reverse_adjacency.items()
+            },
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DependencyGraph":
+        """Reconstruct a DependencyGraph from a serialized dict.
+
+        Args:
+            data: Dictionary previously produced by to_dict()
+
+        Returns:
+            Fully reconstructed DependencyGraph instance
+        """
+        graph = cls()
+
+        for str_path, node_data in data.get("nodes", {}).items():
+            path = Path(str_path)
+            graph.nodes[path] = DependencyNode(
+                file_path=path,
+                language=node_data["language"],
+                imports=node_data["imports"],
+                exports=node_data["exports"],
+                is_processed=node_data["is_processed"],
+                metadata=node_data.get("metadata", {}),
+            )
+
+        for edge_data in data.get("edges", []):
+            graph.edges.append(DependencyEdge(
+                from_node=Path(edge_data["from"]),
+                to_node=Path(edge_data["to"]),
+                import_type=edge_data["import_type"],
+                imported_symbols=edge_data["imported_symbols"],
+                line_number=edge_data["line_number"],
+            ))
+
+        for str_path, str_deps in data.get("adjacency_list", {}).items():
+            graph.adjacency_list[Path(str_path)] = {Path(d) for d in str_deps}
+
+        for str_path, str_deps in data.get("reverse_adjacency", {}).items():
+            graph.reverse_adjacency[Path(str_path)] = {Path(d) for d in str_deps}
+
+        return graph
 
     def get_processing_order(self) -> list[Path]:
         """Get files in topological order for processing.

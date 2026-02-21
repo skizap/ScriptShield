@@ -553,12 +553,53 @@ class GlobalSymbolTable:
                     "line_number": entry.line_number,
                     "symbol_type": entry.symbol_type,
                     "is_exported": entry.is_exported,
-                    "reference_count": len(entry.references),
+                    "references": [
+                        [str(ref_path), ref_line]
+                        for ref_path, ref_line in entry.references
+                    ],
+                    "metadata": entry.metadata,
+                    "_frozen": entry._frozen,
                 }
                 for entry in self._symbols.values()
             ],
             "config": self._mangling_config,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GlobalSymbolTable":
+        """Reconstruct a GlobalSymbolTable from a serialized dict.
+
+        Args:
+            data: Dictionary previously produced by to_dict()
+
+        Returns:
+            Fully reconstructed GlobalSymbolTable instance
+        """
+        table = cls(mangling_config=data.get("config", {}))
+
+        for entry_data in data.get("symbols", []):
+            references = [
+                (Path(ref_path), int(ref_line))
+                for ref_path, ref_line in entry_data.get("references", [])
+            ]
+            entry = SymbolEntry(
+                original_name=entry_data["original_name"],
+                mangled_name=entry_data["mangled_name"],
+                scope=entry_data["scope"],
+                language=entry_data["language"],
+                file_path=Path(entry_data["file_path"]),
+                line_number=entry_data["line_number"],
+                symbol_type=entry_data["symbol_type"],
+                is_exported=entry_data["is_exported"],
+                references=references,
+                metadata=entry_data.get("metadata", {}),
+            )
+            table.add_symbol(entry)
+
+        if data.get("is_frozen", False):
+            table.freeze()
+
+        return table
 
 
 class SymbolTableBuilder:

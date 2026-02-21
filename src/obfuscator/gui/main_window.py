@@ -28,6 +28,7 @@ from obfuscator.gui.widgets import (
     OutputWidget,
     ProfileWidget,
     ProgressWidget,
+    ResumeCheckpointDialog,
     SecurityConfigWidget,
     StartConfirmationDialog,
 )
@@ -43,6 +44,7 @@ from obfuscator.core.config import (
     DEFAULT_MULTIPROCESSING_THRESHOLD,
     ObfuscationConfig,
 )
+from obfuscator.core import CheckpointManager
 from obfuscator.core.orchestrator import ObfuscationOrchestrator, JobState, ErrorStrategy, ProgressInfo
 
 # Module-level logger
@@ -330,17 +332,52 @@ class MainWindow(QMainWindow):
         preset = security_config.get("preset", "Unknown")
         runtime_mode = security_config.get("runtime_mode", "hybrid")
 
-        dialog = StartConfirmationDialog(
-            file_count=len(files),
-            preset=preset,
-            output_path=output_dir,
-            runtime_mode=runtime_mode.capitalize(),
-            parent=self,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.get_user_decision():
-            self.progress_widget.add_log_entry("Obfuscation cancelled by user", "warning")
-            self.action_widget.set_enabled(True)
-            return
+        checkpoint_path = CheckpointManager.find_latest_checkpoint(output_dir)
+        resume_mode = False
+
+        if checkpoint_path is not None:
+            temp_mgr = CheckpointManager(output_dir / ".checkpoints")
+            try:
+                checkpoint_data = temp_mgr.restore_checkpoint(checkpoint_path)
+            except (ValueError, FileNotFoundError) as e:
+                logger.warning(f"Failed to restore checkpoint: {e}")
+                ckpt_session_id = checkpoint_path.parent.name if checkpoint_path else ""
+                temp_mgr.cleanup_checkpoints(ckpt_session_id)
+                checkpoint_path = None
+                resume_mode = False
+            else:
+                ckpt_timestamp = checkpoint_data.get("timestamp", "Unknown")
+                ckpt_progress = checkpoint_data.get("progress", {})
+                files_completed = ckpt_progress.get("files_completed", 0)
+                total_files_ckpt = ckpt_progress.get("total_files", 0)
+                ckpt_session_id = checkpoint_data.get("session_id", "")
+
+                resume_dialog = ResumeCheckpointDialog(
+                    timestamp=ckpt_timestamp,
+                    files_completed=files_completed,
+                    total_files=total_files_ckpt,
+                    parent=self,
+                )
+                if (
+                    resume_dialog.exec() == QDialog.DialogCode.Accepted
+                    and resume_dialog.get_user_decision()
+                ):
+                    resume_mode = True
+                else:
+                    temp_mgr.cleanup_checkpoints(ckpt_session_id)
+
+        if not resume_mode:
+            dialog = StartConfirmationDialog(
+                file_count=len(files),
+                preset=preset,
+                output_path=output_dir,
+                runtime_mode=runtime_mode.capitalize(),
+                parent=self,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.get_user_decision():
+                self.progress_widget.add_log_entry("Obfuscation cancelled by user", "warning")
+                self.action_widget.set_enabled(True)
+                return
 
         # Reset and show progress widget
         self.progress_widget.reset()
@@ -355,33 +392,36 @@ class MainWindow(QMainWindow):
         self._active_total_files = len(files)
 
         # Early conflict detection before creating main orchestrator
-        temp_orchestrator = ObfuscationOrchestrator(config=orchestrator_config)
-        conflict_result = temp_orchestrator.detect_conflicts(input_files, output_dir)
+        conflict_result = None
+        temp_orchestrator = None
+        if not resume_mode:
+            temp_orchestrator = ObfuscationOrchestrator(config=orchestrator_config)
+            conflict_result = temp_orchestrator.detect_conflicts(input_files, output_dir)
 
-        if conflict_result.has_conflicts:
-            from obfuscator.gui.widgets import ConflictResolutionDialog
-            dialog = ConflictResolutionDialog(conflict_result.conflicts, parent=self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                strategy = dialog.get_selected_strategy()
-                if strategy:
-                    temp_orchestrator.set_conflict_strategy(strategy)
-                    self.progress_widget.add_log_entry(
-                        f"Conflict resolution: {strategy.value}", "info"
-                    )
+            if conflict_result.has_conflicts:
+                from obfuscator.gui.widgets import ConflictResolutionDialog
+                dialog = ConflictResolutionDialog(conflict_result.conflicts, parent=self)
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    strategy = dialog.get_selected_strategy()
+                    if strategy:
+                        temp_orchestrator.set_conflict_strategy(strategy)
+                        self.progress_widget.add_log_entry(
+                            f"Conflict resolution: {strategy.value}", "info"
+                        )
+                    else:
+                        # User accepted but no strategy selected - cancel
+                        self.progress_widget.add_log_entry(
+                            "Obfuscation cancelled - no conflict resolution selected", "warning"
+                        )
+                        self.action_widget.set_enabled(True)
+                        return
                 else:
-                    # User accepted but no strategy selected - cancel
+                    # User cancelled the dialog
                     self.progress_widget.add_log_entry(
-                        "Obfuscation cancelled - no conflict resolution selected", "warning"
+                        "Obfuscation cancelled by user", "warning"
                     )
                     self.action_widget.set_enabled(True)
                     return
-            else:
-                # User cancelled the dialog
-                self.progress_widget.add_log_entry(
-                    "Obfuscation cancelled by user", "warning"
-                )
-                self.action_widget.set_enabled(True)
-                return
 
         total_files = len(files)
         BATCH_SIZE = 100
@@ -449,18 +489,31 @@ class MainWindow(QMainWindow):
             # Create orchestrator and apply conflict strategy if set
             orchestrator = ObfuscationOrchestrator(config=orchestrator_config)
             self._current_orchestrator = orchestrator
-            if conflict_result.has_conflicts:
+            if (temp_orchestrator is not None
+                and conflict_result is not None
+                and conflict_result.has_conflicts):
                 # Copy the strategy from temp orchestrator
                 orchestrator.set_conflict_strategy(temp_orchestrator._conflict_strategy)
 
-            result = orchestrator.process_files(
-                input_files=input_files,
-                output_dir=output_dir,
-                config=orchestrator_config.symbol_table_options,
-                progress_callback=on_progress,
-                error_callback=on_error,
-                error_strategy=ErrorStrategy.ASK
-            )
+            if resume_mode:
+                result = orchestrator.resume_from_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    input_files=input_files,
+                    output_dir=output_dir,
+                    config=orchestrator_config.symbol_table_options,
+                    progress_callback=on_progress,
+                    error_callback=on_error,
+                    error_strategy=ErrorStrategy.ASK,
+                )
+            else:
+                result = orchestrator.process_files(
+                    input_files=input_files,
+                    output_dir=output_dir,
+                    config=orchestrator_config.symbol_table_options,
+                    progress_callback=on_progress,
+                    error_callback=on_error,
+                    error_strategy=ErrorStrategy.ASK,
+                )
 
             # Check for cancelled state
             if result.current_state == JobState.CANCELLED:
