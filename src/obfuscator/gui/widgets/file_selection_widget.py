@@ -82,7 +82,6 @@ class FileSelectionWidget(QWidget):
         # Drag-and-drop zone
         self._drop_zone = self._create_drop_zone()
         layout.addWidget(self._drop_zone)
- +++++++ REPLACE
 
         # File list
         self._file_list = QListWidget()
@@ -127,7 +126,7 @@ class FileSelectionWidget(QWidget):
         drop_text.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px;")
         drop_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         drop_layout.addWidget(drop_text)
- +++++++ REPLACE
+ 
 
         or_label = QLabel("— or —")
         or_label.setStyleSheet(f"color: {COLORS['text_disabled']}; font-size: 11px;")
@@ -159,8 +158,8 @@ class FileSelectionWidget(QWidget):
         button_layout.addWidget(browse_folder_btn)
         
         drop_layout.addWidget(button_widget, alignment=Qt.AlignmentFlag.AlignCenter)
- +++++++ REPLACE
- +++++++ REPLACE
+ 
+ 
 
         return drop_zone
 
@@ -182,7 +181,7 @@ class FileSelectionWidget(QWidget):
                 logger.debug(f"Drag enter with {len(urls)} item(s)")
                 return
         event.ignore()
- +++++++ REPLACE
+ 
 
     def _on_drag_move(self, event) -> None:
         """Handle drag move event."""
@@ -228,7 +227,7 @@ class FileSelectionWidget(QWidget):
                     logger.info(f"Dropped {file_count} file(s)")
                 return
         event.ignore()
- +++++++ REPLACE
+ 
 
     def _on_browse_clicked(self) -> None:
         """Handle browse button click with file/folder selection option."""
@@ -271,7 +270,7 @@ class FileSelectionWidget(QWidget):
                 if discovered:
                     self._add_files(discovered)
                     logger.info(f"Added {len(discovered)} files from folder")
- +++++++ REPLACE
+ 
 
     def _on_browse_folder_clicked(self) -> None:
         """Handle browse folder button click."""
@@ -286,7 +285,7 @@ class FileSelectionWidget(QWidget):
             if discovered:
                 self._add_files(discovered)
                 logger.info(f"Added {len(discovered)} files from folder")
- +++++++ REPLACE
+ 
 
     def _scan_folder_recursively(self, folder_path: Path) -> List[Path]:
         """
@@ -318,7 +317,7 @@ class FileSelectionWidget(QWidget):
             logger.warning(f"Cannot access folder: {folder_path} - {e}")
 
         return discovered_files
- +++++++ REPLACE
+ 
 
     def _add_files(self, paths: List[Path]) -> None:
         """
@@ -586,7 +585,7 @@ class FileSelectionWidget(QWidget):
             self._file_count_label.setText(f"{count} files selected")
         
         self._file_count_label.setVisible(count > 0)
- +++++++ REPLACE
+ 
 
     def get_files(self) -> List[str]:
         """
