@@ -527,6 +527,9 @@ class WorkerProcess:
         self.python_processor = PythonProcessor(config=self.config)
         self.lua_processor = LuaProcessor(config=self.config)
 
+        from obfuscator.core.plugin_manager import PluginManager
+        self.plugin_manager = PluginManager()
+
         # Imported lazily to avoid module import cycles when orchestrator imports
         # worker utilities at module load time.
         from obfuscator.core.orchestrator import ConflictStrategy
@@ -799,7 +802,7 @@ class WorkerProcess:
                 )
 
             ast_node = parse_result.ast_node
-            engine = ObfuscationEngine(self.config)
+            engine = ObfuscationEngine(self.config, plugin_manager=self.plugin_manager)
             transformation_count = 0
 
             if language == "python":

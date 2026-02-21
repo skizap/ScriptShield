@@ -122,13 +122,26 @@ class PluginManager:
                 logger.warning(f"Plugin {subdir.name}: failed to instantiate: {exc}")
                 continue
             
+            # Assign validated metadata to the instance
+            try:
+                plugin_instance.metadata = metadata
+            except Exception as exc:
+                logger.warning(f"Plugin {subdir.name}: failed to assign metadata: {exc}")
+                continue
+            
             plugins.append(plugin_instance)
         
-        # Sort by priority (lower = earlier)
-        plugins.sort(key=lambda p: p.metadata.priority)
+        # Filter out plugins without metadata attribute before sorting
+        valid_plugins = [p for p in plugins if hasattr(p, "metadata")]
+        if len(valid_plugins) != len(plugins):
+            skipped_count = len(plugins) - len(valid_plugins)
+            logger.warning(f"Skipped {skipped_count} plugin(s) missing metadata attribute")
         
-        logger.info(f"Successfully loaded {len(plugins)} plugin(s)")
-        return plugins
+        # Sort by priority (lower = earlier)
+        valid_plugins.sort(key=lambda p: p.metadata.priority)
+        
+        logger.info(f"Successfully loaded {len(valid_plugins)} plugin(s)")
+        return valid_plugins
     
     def _validate_metadata(self, data: dict) -> PluginMetadata:
         """Validate plugin metadata from JSON.

@@ -833,15 +833,9 @@ class LuaProcessor:
                     self.logger.debug("Using provided ObfuscationEngine instance")
                 else:
                     self._current_engine = ObfuscationEngine(self._config)
-                    self.logger.debug("Created new ObfuscationEngine instance")
 
                 engine_result = self._current_engine.apply_transformations(
-                    ast_node, "lua", path
-                )
-                normalized_engine_errors = self._normalize_transform_errors(
-                    engine_result.errors,
-                    path,
-                    "TransformationError",
+                    ast_node, "lua", path, global_table
                 )
 
                 if engine_result.success:

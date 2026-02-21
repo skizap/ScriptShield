@@ -7,11 +7,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from obfuscator.core.config import ObfuscationConfig
     from obfuscator.core.symbol_table import GlobalSymbolTable
+    from obfuscator.processors.ast_transformer import TransformResult
 
 
 @dataclass
@@ -53,7 +54,7 @@ class ObfuscatorPlugin(ABC):
     """Class-level or instance attribute; must be set by every concrete plugin."""
     
     @abstractmethod
-    def transform(self, ast_node: Any, context: PluginContext) -> Any:
+    def transform(self, ast_node: "TransformResult", context: PluginContext) -> "TransformResult":
         """Transform an AST node.
         
         Args:

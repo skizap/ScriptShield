@@ -830,7 +830,7 @@ class PythonProcessor:
                     logger.debug("Created new ObfuscationEngine instance")
 
                 engine_result = self._current_engine.apply_transformations(
-                    result.ast_node, "python", path
+                    result.ast_node, "python", path, symbol_table
                 )
 
                 normalized_name_mangling_errors = self._normalize_transform_errors(

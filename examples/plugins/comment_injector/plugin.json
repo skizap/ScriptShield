@@ -1,0 +1,9 @@
+{
+  "name": "comment_injector",
+  "version": "1.0.0",
+  "author": "ScriptShield",
+  "description": "Injects a harmless comment/docstring at the top of the AST",
+  "supported_languages": ["python", "lua"],
+  "priority": 100,
+  "requires_runtime": false
+}

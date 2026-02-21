@@ -41,6 +41,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from obfuscator.core.config import ObfuscationConfig
+from obfuscator.core.plugin_interface import PluginContext
+from obfuscator.core.plugin_manager import PluginManager
 from obfuscator.core.runtime_manager import RuntimeManager
 from obfuscator.processors.ast_transformer import (
     AntiDebuggingTransformer,
@@ -76,8 +78,10 @@ class ObfuscationEngine:
 
     Attributes:
         config: The ObfuscationConfig controlling which features are enabled.
+        plugin_manager: Optional PluginManager for third-party extensions.
         runtime_manager: The RuntimeManager instance for runtime code generation.
         required_runtimes: Set of feature names that require runtime code.
+        plugin_runtimes: Dict mapping plugin names to their generated runtime code.
 
     Example:
         >>> engine = ObfuscationEngine(config)
@@ -113,15 +117,18 @@ class ObfuscationEngine:
         ("vm_protection", VMProtectionTransformer),
     ]
 
-    def __init__(self, config: ObfuscationConfig) -> None:
+    def __init__(self, config: ObfuscationConfig, plugin_manager: PluginManager | None = None) -> None:
         """Initialize the obfuscation engine.
 
         Args:
             config: ObfuscationConfig instance with feature flags and options.
+            plugin_manager: Optional PluginManager for third-party extensions.
         """
         self.config = config
+        self.plugin_manager = plugin_manager
         self.runtime_manager = RuntimeManager(config)
         self.required_runtimes: set[str] = set()
+        self.plugin_runtimes: dict[str, str] = {}
         logger.debug(
             f"ObfuscationEngine initialized with config '{config.name}', "
             f"features: {config.features}"
@@ -225,6 +232,7 @@ class ObfuscationEngine:
         ast_node: Any,
         language: str,
         file_path: Path,
+        symbol_table: Any = None,
     ) -> TransformResult:
         """Apply the full transformation pipeline to an AST.
 
@@ -244,6 +252,7 @@ class ObfuscationEngine:
         """
         # Reset runtime tracking at the start of each transformation pipeline
         self.required_runtimes = set()
+        self.plugin_runtimes = {}
 
         transformers = self.get_enabled_transformers(language)
 
@@ -366,6 +375,28 @@ class ObfuscationEngine:
             f"Transformation pipeline completed for {file_path.name}: "
             f"{total_count} total transformations"
         )
+
+        if self.plugin_manager is not None:
+            context = PluginContext(
+                config=self.config,
+                symbol_table=symbol_table,
+                language=language
+            )
+            plugins = self.plugin_manager.get_plugins_for_language(language)
+            for plugin in plugins:
+                logger.debug(f"Applying plugin: {plugin.metadata.name}")
+                result = self.plugin_manager.execute_plugin(plugin, current_ast, context)
+                current_ast = result.ast_node
+                total_count += result.transformation_count
+                all_errors.extend(result.errors)
+
+                if plugin.metadata.requires_runtime:
+                    try:
+                        runtime_str = plugin.generate_runtime(context)
+                        if runtime_str:
+                            self.plugin_runtimes[plugin.metadata.name] = runtime_str
+                    except Exception as e:
+                        logger.warning(f"Plugin {plugin.metadata.name} failed to generate runtime code: {e}")
 
         return TransformResult(
             ast_node=current_ast,
@@ -498,7 +529,7 @@ class ObfuscationEngine:
         Returns:
             True if runtime code is required, False otherwise.
         """
-        return len(self.required_runtimes) > 0
+        return len(self.required_runtimes) > 0 or len(self.plugin_runtimes) > 0
 
     def get_required_runtime_code(self, language: str) -> str:
         """Get combined runtime code for all required features.
@@ -517,7 +548,7 @@ class ObfuscationEngine:
         if self.config.runtime_mode != "embedded":
             return ""
 
-        if not self.required_runtimes:
+        if not self.required_runtimes and not self.plugin_runtimes:
             return ""
 
         try:
@@ -551,10 +582,27 @@ class ObfuscationEngine:
                     parts.append(code)
                     logger.debug(f"Generated runtime code for {runtime_type} ({language})")
 
+            # Add plugin runtimes
+            for plugin_name, runtime_str in self.plugin_runtimes.items():
+                if not runtime_str:
+                    continue
+                if parts and not parts[-1].endswith('\n'):
+                    parts.append('')
+                if language == "python":
+                    parts.append(f'\n# {"=" * 60}')
+                    parts.append(f'# Plugin Runtime: {plugin_name}')
+                    parts.append(f'# {"=" * 60}\n')
+                else:  # lua
+                    parts.append(f'\n-- {"=" * 60}')
+                    parts.append(f'-- Plugin Runtime: {plugin_name}')
+                    parts.append(f'-- {"=" * 60}\n')
+                parts.append(runtime_str)
+                logger.debug(f"Generated plugin runtime code for {plugin_name} ({language})")
+
             combined_code = '\n'.join(parts)
             logger.info(
                 f"Generated runtime code for {len(self.required_runtimes)} applied features "
-                f"({len(combined_code)} chars)"
+                f"and {len(self.plugin_runtimes)} plugins ({len(combined_code)} chars)"
             )
             return combined_code
 
@@ -579,7 +627,7 @@ class ObfuscationEngine:
         if self.config.runtime_mode != "embedded":
             return ast_node
 
-        if not self.required_runtimes:
+        if not self.has_runtime_requirements():
             return ast_node
 
         try:
